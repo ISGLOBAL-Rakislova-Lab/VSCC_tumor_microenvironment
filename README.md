@@ -196,7 +196,8 @@ The study was approved by the Institutional Ethics Committee of Hospital Clínic
 
 If you use this code or data, please cite the article:
 
-> [Authors]. Data and code for "[Title]". Zenodo. https://doi.org/10.5281/zenodo.17426391
+> **Plasmacytoid dendritic cells and M2 macrophages are associated with clinical outcome in Human Papillomavirus (HPV)-independent vulvar squamous cell carcinoma**
+Núria Peñuelas, Lia Sisuashvili, Lorena Marimón, Laia Díez-Ahijado, Núria Carreras-Dieguez, Clement Gonzalez Serra, Katarzyna Darecka, Juan Muñoz-Hurtado, Adela Saco, Marta del Pino, Aureli Torné, Silvia Valls-Losada, Anna Escoda-Suarez, Beatriz Sánchez-Hoyo, Lydia Gaba, Jaume Ordi, Robert Albero, Natalia Rakislova.
 
 ## 11. License
 
