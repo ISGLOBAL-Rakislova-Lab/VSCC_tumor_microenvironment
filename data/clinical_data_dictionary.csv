@@ -1,0 +1,21 @@
+variable,description
+case_id,Anonymized case identifier (matches the columns of the count matrix)
+hpv_status,HPV-associated / HPV-independent
+figo_stage,FIGO stage group (initial / advanced)
+tumor_size_category,Tumor size (<=25 mm / >25 mm)
+depth_invasion_category,Depth of invasion (<=5 mm / >5 mm)
+lymph_node_status,Lymph node status
+surgical_margins,Surgical margin status
+p53_ihc_status,p53 immunohistochemistry pattern (Normal / Abnormal)
+pdl1_ic_percent,PD-L1 (SP142): % positive tumor-infiltrating immune cells (HPV-I only)
+pdl1_status,PD-L1 status (Positive = immune cells >=1%)
+rfs_months_60,"Recurrence-free survival time (months, truncated at 60)"
+recurrence_60,"Recurrence within 60 months (1 = event, 0 = censored)"
+dss_months_60,"Disease-specific survival time (months, truncated at 60)"
+disease_death_60,"Death from vulvar cancer within 60 months (1 = event, 0 = censored)"
+cd123_tumor_area_pct,"% CD123+ cells, overall tumor area (HPV-I; NA = not assessable)"
+cd123_stroma_pct,"% CD123+ cells, tumor-associated stroma"
+cd123_perivascular_pct,"% CD123+ cells, perivascular areas"
+cd163_tumor_area_pct,"% CD163+ cells, overall tumor area (HPV-I; NA = not assessable)"
+cd163_stroma_pct,"% CD163+ cells, tumor-associated stroma"
+cd163_perivascular_pct,"% CD163+ cells, perivascular areas"
