@@ -1,8 +1,8 @@
-# Immune microenvironment of HPV-independent vulvar squamous cell carcinoma
+# Tumor microenvironment of HPV-independent vulvar squamous cell carcinoma
 
 Analysis code and anonymized data accompanying the manuscript:
 
-> **Plasmacytoid dendritic cells and M2 macrophages are associated with clinical outcome in Human Papillomavirus (HPV)-independent vulvar squamous cell carcinoma**
+> Plasmacytoid dendritic cells and M2 macrophages are associated with clinical outcome in Human Papillomavirus (HPV)-independent vulvar squamous cell carcinoma
 Núria Peñuelas, Lia Sisuashvili, Lorena Marimón, Laia Díez-Ahijado, Núria Carreras-Dieguez, Clement Gonzalez Serra, Katarzyna Darecka, Juan Muñoz-Hurtado, Adela Saco, Marta del Pino, Aureli Torné, Silvia Valls-Losada, Anna Escoda-Suarez, Beatriz Sánchez-Hoyo, Lydia Gaba, Jaume Ordi, Robert Albero, Natalia Rakislova.
 
 
@@ -15,7 +15,8 @@ This repository contains the R scripts used to:
 1. Estimate immune and stromal cell populations from targeted transcriptomic data (HTG EdgeSeq) using four deconvolution algorithms: **xCell** (main analysis), **EPIC**, **quanTIseq** and **MCP-counter** (supporting analyses).
 2. Compare the tumor microenvironment (TME) between HPV-associated (HPV-A, n=18) and HPV-independent (HPV-I, n=52) vulvar squamous cell carcinoma (VSCC), and within HPV-I tumors according to p53 immunohistochemistry (IHC) and PD-L1 status.
 3. Evaluate the association of deconvolution-derived cell populations with recurrence-free survival (RFS) and disease-specific survival (DSS) in HPV-I VSCC.
-4. Validate the main findings by IHC for **CD123** (n=43) and **CD163** (n=50), including an exploratory analysis combining CD163 and PD-L1.
+4. Evaluate the main findings at the protein level by IHC for **CD123** (n=43) and **CD163** (n=50), including an exploratory analysis combining CD163 and PD-L1.
+5. Explore a 12-chemokine tertiary lymphoid structure (TLS) gene signature.
 
 All analyses use the same 70 cases (18 HPV-A, 52 HPV-I).
 
@@ -26,12 +27,14 @@ All analyses use the same 70 cases (18 HPV-A, 52 HPV-I).
 ```
 .
 ├── README.md
+├── LICENSE
 ├── data/
-│   ├── counts_filtered_filtered_20260921_anonymized.csv
+│   ├── counts_matrix_anonymized.csv.csv
 │   ├── clinical_data_anonymized.csv
-│   └── clinical_data_dictionary.csv
+│   ├── clinical_data_dictionary.csv
+│   └── LICENSE.md
 └── scripts/
-    ├── 00_load_public_data.R
+    ├── 01_Loading_data.Rmd
     ├── 02_Descriptive_tables.Rmd
     ├── 03_Comparison_HPV_status_xCell.Rmd
     ├── 04_Comparison_HPV_status_EPIC.Rmd
@@ -52,7 +55,8 @@ All analyses use the same 70 cases (18 HPV-A, 52 HPV-I).
     ├── 19_IHC_CD123_analysis.Rmd
     ├── 20_IHC_CD163_analysis.Rmd
     ├── 21_Comparison_full_cohort_vs_IHC_cohorts.Rmd
-    └── 22_CD123_CD163_PDL1_correlation.Rmd
+    ├── 22_CD123_CD163_PDL1_correlation.Rmd
+    └── 23_TLS_signature_analysis.Rmd
 ```
 
 ---
@@ -63,7 +67,7 @@ All files in `data/` are anonymized and contain only the 70 cases analysed in th
 
 | File | Content |
 |---|---|
-| `counts_filtered_filtered_20260921_anonymized.csv` | Filtered HTG EdgeSeq count matrix (10,513 genes × 70 cases). First column `gene` (gene symbol); remaining columns are cases. This is the matrix used as input for all deconvolution analyses. |
+| `counts_matrix_anonymized.csv` | Filtered HTG EdgeSeq count matrix (10,513 genes × 70 cases). First column `gene` (gene symbol); remaining columns are cases. This is the matrix used as input for all deconvolution analyses. |
 | `clinical_data_anonymized.csv` | One row per case: HPV status, clinicopathological variables used in the analyses, PD-L1, follow-up (RFS and DSS, truncated at 60 months) and CD123/CD163 IHC percentages. |
 | `clinical_data_dictionary.csv` | Description of every variable in the clinical file. |
 
@@ -94,7 +98,8 @@ The analyses were performed with **R 4.4.0 on Windows 11**. Main packages and ve
 | edgeR | 4.2.2 | Bioconductor |
 | limma | 3.60.6 | Bioconductor |
 | ComplexHeatmap | 2.20.0 | Bioconductor |
-| coxphf | [version] | CRAN |
+| GSVA | 1.52.3 | Bioconductor |
+| coxphf | 1.13.4 | CRAN |
 | maxstat | 0.7-26 | CRAN |
 | survival | 3.8-6 | CRAN |
 | survminer | 0.5.2 | CRAN |
@@ -106,7 +111,7 @@ The analyses were performed with **R 4.4.0 on Windows 11**. Main packages and ve
 | tibble | 3.2.1 | CRAN |
 | ggpubr | 0.6.3 | CRAN |
 | rstatix | 0.7.3 | CRAN |
-| openxlsx | [version] | CRAN |
+| openxlsx | 4.2.8.1 | CRAN |
 
 Installation (example):
 
@@ -116,24 +121,26 @@ install.packages(c("coxphf", "maxstat", "survival", "survminer", "gtsummary",
                    "rstatix", "openxlsx", "readr", "ggrepel", "remotes"))
 
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-BiocManager::install(c("edgeR", "limma", "ComplexHeatmap"))
+BiocManager::install(c("edgeR", "limma", "ComplexHeatmap", "GSVA"))
 
 remotes::install_github("omnideconv/immunedeconv")
 ```
 
-The complete `sessionInfo()` of the environment used for the article is provided at the end of each script.
+The complete `sessionInfo()` of the environment used for the article is provided at the end of `01_Loading_data.Rmd`.
 
 ---
 
 ## 5. How to run
 
-1. Clone the repository and set the repository root as the working directory.
-2. Run `scripts/00_load_public_data.R`. It reads the files in `data/` and creates all objects used by the downstream scripts, with the same names and codings used during the analysis:
-   - `counts_filtered_filtered`, `counts_HPV_Associated`, `counts_HPV_Independent`
-   - `TP53status_clinical`, `TP53status_clinical_HPVas`, `TP53status_clinical_HPVind`
-   - `CD123_5`, `CD163` (IHC tables)
-3. Run the scripts in numerical order within the same R session (or `source("scripts/00_load_public_data.R")` at the start of each script).
+The scripts are provided to document the analyses exactly as performed. They were written for the internal data objects used during the study and read the original (non-public) input files; to run them with the public data in `data/`, the loading steps need to be adapted. The scripts are designed to be run in numerical order within the same R session.
 
+The public files correspond to the objects used in the scripts as follows:
+
+| Object in the scripts | Public file | Notes |
+|---|---|---|
+| `counts_filtered_filtered` | `ccounts_matrix_anonymized.csv` | Genes as row names (first column `gene`), cases as columns |
+| `TP53status_clinical` (and HPV subsets `TP53status_clinical_HPVas` / `_HPVind`) | `clinical_data_anonymized.csv` | Case identifier: `id` in the scripts, `case_id` in the public file; variable names and codings are described in `clinical_data_dictionary.csv` |
+| `CD123_5`, `CD163` | `clinical_data_anonymized.csv` (columns `cd123_*` and `cd163_*`) | In the scripts, IHC columns are named `Positive_cells_tumoral_area`, `Positive_cells_tumor_stroma` and `Positive_cells_perivascular_areas`, with the case identifier `Case_ID` |
 
 ---
 
@@ -141,7 +148,7 @@ The complete `sessionInfo()` of the environment used for the article is provided
 
 | Script | Analysis | Output in the article |
 |---|---|---|
-| `00_load_public_data.R` | Loads the anonymized data | — |
+| `01_Loading_data` | Loads the data, creates HPV subsets, reports package versions and `sessionInfo()` | — |
 | `02_Descriptive_tables` | Clinicopathological characteristics by HPV status | Table 1 (requires the complete clinical dataset; see Section 7) |
 | `03_Comparison_HPV_status_xCell` | xCell deconvolution, filtering of cell types, PCA, HPV-A vs HPV-I comparisons (Wilcoxon, BH-FDR), heatmap | Figure 1; Supplementary Tables on filtered cell types, PCA contributors and PCA regression |
 | `04–06_Comparison_HPV_status_*` | Same analyses with EPIC, MCP-counter and quanTIseq | Supplementary Figure 2; PCA regression tables |
@@ -153,6 +160,7 @@ The complete `sessionInfo()` of the environment used for the article is provided
 | `20_IHC_CD163_analysis` | CD163 IHC: PD-L1 comparison, survival models, PH tests, bootstrap; exploratory PD-L1 × CD163 analysis | Figure 5; Supplementary Data 8–10; Supplementary Table 9 |
 | `21_Comparison_full_cohort_vs_IHC_cohorts` | Included vs excluded cases in the IHC cohorts | Supplementary Table 8 (see Section 7) |
 | `22_CD123_CD163_PDL1_correlation` | Spearman correlations among CD123, CD163 and PD-L1; CD123 distribution across PD-L1/CD163 groups | Results (correlation analysis) |
+| `23_TLS_signature_analysis` | Exploratory 12-chemokine TLS signature (GSVA): group comparisons, correlations with xCell populations and CD123/CD163 IHC, survival analyses | Supplementary Figure 6; Supplementary Tables 11–13 |
 
 ---
 
@@ -172,13 +180,15 @@ The complete `sessionInfo()` of the environment used for the article is provided
 
 **Bootstrap optimism correction** (1,000 resamples, `seed = 1`) was applied to multivariable models whose enrichment term reached BH-adjusted p<0.05, re-estimating the cut-point in each resample. Resamples in which either group contained no events (in the bootstrap sample, or after applying the bootstrap cut-point to the original data) were excluded; the proportion of valid resamples is reported. For models with complete separation in the original data (e.g., no events in the high-infiltration group), bootstrap correction is not informative.
 
+**TLS signature.** The 12-chemokine TLS signature (CCL2, CCL3, CCL4, CCL5, CCL8, CCL18, CCL19, CCL21, CXCL9, CXCL10, CXCL11, CXCL13) was scored by GSVA on TMM-normalized log2-CPM values. Survival analyses followed the same two-step strategy; given its exploratory nature, bootstrap optimism correction and proportional-hazards testing were not performed for this signature.
+
 **Combined IHC analyses.** Analyses combining IHC markers (correlation, PD-L1/CD163 stratification) use the overall tumor area, with high infiltration defined as values above the maxstat-derived DSS cut-off (>30% CD123⁺ cells; >15% CD163⁺ cells).
 
 ---
 
 ## 8. Reproducibility notes
 
-- **Complete clinical data.** Table 1 (`02`) and Supplementary Table 8 (`21`) include variables that are not in the public file (age, histologic type, lymphovascular invasion, surgery type, radiotherapy) and were generated from the complete clinical dataset. With the public data, script `21` reproduces all remaining rows. The PCA regression models (`03`–`14`) include age as a covariate; to run them with the public data, remove `age` from the model formula (estimates for the remaining variables may differ slightly from those reported).
+- **Complete clinical data.** Table 1 (`02`) and Supplementary Table 8 (`21`) include variables that are not in the public file (age, histologic type, lymphovascular invasion, surgery type, radiotherapy) and were generated from the complete clinical dataset. With the public data, script `21` reproduces all remaining rows. The PCA regression models (`03`–`10`) include age as a covariate; to run them with the public data, remove `age` from the model formula (estimates for the remaining variables may differ slightly from those reported).
 - **Survival times.** Survival times in the public file are rounded to one decimal to limit re-identification risk. RFS analyses are reproduced exactly. DSS estimates may differ slightly from those reported (typically in the second or third decimal), without changing any conclusion.
 - **Package versions and platform.** Deconvolution estimates, particularly near-zero values, can differ slightly between package versions and operating systems, which may produce small differences in rank-based tests and in PCA. The results in the article were obtained with the versions listed in Section 4 (R 4.4.0, Windows 11).
 - **MCP-counter.** In immunedeconv, the MCP-counter "monocytic lineage" signature is reported under two names ("Monocyte" and "Macrophage/Monocyte") with identical values. Both were retained, as in the article; they should be interpreted as a single population.
@@ -196,13 +206,14 @@ The study was approved by the Institutional Ethics Committee of Hospital Clínic
 
 If you use this code or data, please cite the article:
 
-> **Plasmacytoid dendritic cells and M2 macrophages are associated with clinical outcome in Human Papillomavirus (HPV)-independent vulvar squamous cell carcinoma**
+> Plasmacytoid dendritic cells and M2 macrophages are associated with clinical outcome in Human Papillomavirus (HPV)-independent vulvar squamous cell carcinoma
 Núria Peñuelas, Lia Sisuashvili, Lorena Marimón, Laia Díez-Ahijado, Núria Carreras-Dieguez, Clement Gonzalez Serra, Katarzyna Darecka, Juan Muñoz-Hurtado, Adela Saco, Marta del Pino, Aureli Torné, Silvia Valls-Losada, Anna Escoda-Suarez, Beatriz Sánchez-Hoyo, Lydia Gaba, Jaume Ordi, Robert Albero, Natalia Rakislova.
 
 ## 11. License
 
-Code: [MIT License]. Data: [CC BY 4.0].
+Code: MIT License (see `LICENSE`). Data in `data/`: CC BY 4.0 (see `data/LICENSE.md`).
 
 ## 12. Contact
 
-[Natalia Rakislova] — [natalia.rakislova@isglobal.org]
+Natalia Rakislova — natalia.rakislova@isglobal.org
+
