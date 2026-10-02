@@ -1,0 +1,187 @@
+
+#CD123, CD163 and PD-L1 correlation in HPV-I VSCC
+
+```{r}
+# ============================================================
+# 0. CAPTURE EACH SCRIPT'S ihc_data UNDER ITS OWN NAME
+# Run this right after finishing each script -- both scripts
+# create an object called `ihc_data`
+# ============================================================
+
+ihc_data_cd123 <- ihc_data   # run right after the CD123 script
+
+ihc_data_cd163 <- ihc_data   # run right after the CD163 script
+
+stopifnot(exists("ihc_data_cd123"), exists("ihc_data_cd163"))
+
+# Sanity check: confirm the compartment columns exist where expected
+stopifnot(all(c("Case_ID", "Positive_cells_tumoral_area") %in% names(ihc_data_cd123)))
+stopifnot(all(c("Case_ID", "Positive_cells_tumor_stroma") %in% names(ihc_data_cd163)))
+
+# Confirm the continuous PD-L1 field actually exists under this name;
+# if not, this prints the candidates so you can fix the name below.
+if (!"pdl1_immune_cells_pos" %in% names(ihc_data_cd163)) {
+  cat("`pdl1_immune_cells_pos` not found. Candidate columns:\n")
+  print(grep("pdl1", names(ihc_data_cd163), ignore.case = TRUE, value = TRUE))
+  stop("Fix the continuous PD-L1 column name before continuing.")
+}
+```
+
+
+```{r}
+# =============================================================================
+# CD123 / CD163 / PD-L1 CORRELATION AND OVERLAP - HPV-independent VSCC
+# -----------------------------------------------------------------------------
+# Requires the IHC datasets created by the CD123 and CD163 scripts.
+# At the END of each of those scripts, save them with:
+#
+  saveRDS(ihc_data, "ihc_data_cd123.rds")   # end of CD123 script
+ saveRDS(ihc_data, "ihc_data_cd163.rds")   # end of CD163 script
+#
+# Reported in the manuscript (Results, CD163 section):
+#   Spearman correlations among continuous CD123 (overall tumor area),
+#   CD163 (overall tumor area) and PD-L1 (% immune cells), BH-FDR corrected,
+#   in cases with all three markers available (n=42).
+# =============================================================================
+
+library(dplyr)
+library(tidyr)
+library(maxstat)
+library(survival)
+library(openxlsx)
+
+ihc_data_cd123 <- readRDS("ihc_data_cd123.rds")
+ihc_data_cd163 <- readRDS("ihc_data_cd163.rds")
+
+# Sanity checks
+stopifnot(all(c("Case_ID", "Positive_cells_tumoral_area") %in% names(ihc_data_cd123)))
+stopifnot(all(c("Case_ID", "Positive_cells_tumoral_area",
+                "pdl1_immune_cells_pos", "pdl1_immune_cells_pos_category")
+              %in% names(ihc_data_cd163)))
+```
+
+
+
+```{r}
+# =============================================================================
+# 1. SPEARMAN CORRELATION (continuous measurements, n=42)
+# =============================================================================
+
+cor_data <- ihc_data_cd123 %>%
+  select(Case_ID, CD123 = Positive_cells_tumoral_area) %>%
+  inner_join(
+    ihc_data_cd163 %>%
+      select(Case_ID,
+             CD163 = Positive_cells_tumoral_area,
+             PD_L1 = pdl1_immune_cells_pos),
+    by = "Case_ID"
+  ) %>%
+  drop_na(CD123, CD163, PD_L1)
+
+cat("Cases with CD123, CD163 and PD-L1 available:", nrow(cor_data), "\n")  # 42
+
+run_spearman <- function(data, var1, var2) {
+  test <- cor.test(data[[var1]], data[[var2]], method = "spearman", exact = FALSE)
+  tibble(
+    Marker_1     = var1,
+    Marker_2     = var2,
+    N            = nrow(data),
+    Spearman_rho = unname(test$estimate),
+    P_value      = test$p.value
+  )
+}
+
+cor_results <- bind_rows(
+  run_spearman(cor_data, "CD163", "PD_L1"),
+  run_spearman(cor_data, "CD123", "CD163"),
+  run_spearman(cor_data, "CD123", "PD_L1")
+) %>%
+  mutate(FDR = p.adjust(P_value, method = "BH"))
+
+cor_results
+# Expected: CD163-PD-L1 rho=0.37, FDR=0.044
+#           CD123-CD163 rho=0.02, FDR=0.898
+#           CD123-PD-L1 rho=0.10, FDR=0.788
+```
+
+
+
+```{r}
+# =============================================================================
+# 2. MAXSTAT (DSS) CUT-OFFS - overall tumor area
+#    Same definition as in the survival analyses: High = value > cut-off
+# =============================================================================
+
+find_maxstat_cutoff_ihc <- function(time_var, event_var, marker_var, data) {
+  d <- data[!is.na(data[[marker_var]]) & !is.na(data[[time_var]]) &
+              !is.na(data[[event_var]]), ]
+  if (nrow(d) < 10) return(NA_real_)
+  fmla <- as.formula(paste0("survival::Surv(", time_var, ", ", event_var,
+                            ") ~ ", marker_var))
+  ms <- tryCatch(
+    maxstat::maxstat.test(fmla, data = d, smethod = "LogRank", pmethod = "Lau92",
+                          iscores = TRUE, minprop = 0.2, maxprop = 0.8),
+    error = function(e) NULL
+  )
+  if (is.null(ms)) return(NA_real_)
+  unname(ms$estimate)
+}
+
+cd123_cutoff <- find_maxstat_cutoff_ihc("time_death_surv_60m", "death_disease_60m",
+                                        "Positive_cells_tumoral_area", ihc_data_cd123)
+cd163_cutoff <- find_maxstat_cutoff_ihc("time_death_surv_60m", "death_disease_60m",
+                                        "Positive_cells_tumoral_area", ihc_data_cd163)
+
+cat("CD123 tumor-area cut-off (DSS):", cd123_cutoff, "\n")  # 30
+cat("CD163 tumor-area cut-off (DSS):", cd163_cutoff, "\n")  # 15
+```
+
+
+
+```{r}
+# =============================================================================
+# 3. CD123 status within PD-L1 / CD163 groups (n=42)
+#    (cross-tabulation reported in the response to Reviewer 2)
+# =============================================================================
+
+three_marker_data <- ihc_data_cd123 %>%
+  select(Case_ID, CD123 = Positive_cells_tumoral_area) %>%
+  inner_join(
+    ihc_data_cd163 %>%
+      select(Case_ID,
+             CD163 = Positive_cells_tumoral_area,
+             pdl1_immune_cells_pos_category),
+    by = "Case_ID"
+  ) %>%
+  drop_na(CD123, CD163, pdl1_immune_cells_pos_category) %>%
+  mutate(
+    CD123_high = CD123 > cd123_cutoff,          # same rule as survival models
+    CD163_high = CD163 > cd163_cutoff,
+    PDL1_pos   = pdl1_immune_cells_pos_category == "Positive",
+    PDL1_CD163_group = factor(
+      case_when(
+         PDL1_pos &  CD163_high ~ "PD-L1+ / CD163-high",
+         PDL1_pos & !CD163_high ~ "PD-L1+ / CD163-low",
+        !PDL1_pos &  CD163_high ~ "PD-L1- / CD163-high",
+        !PDL1_pos & !CD163_high ~ "PD-L1- / CD163-low"
+      ),
+      levels = c("PD-L1+ / CD163-high", "PD-L1+ / CD163-low",
+                 "PD-L1- / CD163-high", "PD-L1- / CD163-low")
+    ),
+    CD123_status = factor(ifelse(CD123_high, "CD123 high", "CD123 low"),
+                          levels = c("CD123 low", "CD123 high"))
+  )
+
+cat("Cases with all three markers:", nrow(three_marker_data), "\n")  # 42
+
+crosstab <- three_marker_data %>%
+  count(PDL1_CD163_group, CD123_status, name = "N", .drop = FALSE) %>%
+  pivot_wider(names_from = CD123_status, values_from = N, values_fill = 0) %>%
+  mutate(Total = `CD123 low` + `CD123 high`)
+
+crosstab
+cat("Grand total:", sum(crosstab$Total), "\n")
+```
+
+
+

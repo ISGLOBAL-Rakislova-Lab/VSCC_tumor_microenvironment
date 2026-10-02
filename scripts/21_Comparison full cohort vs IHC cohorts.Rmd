@@ -1,0 +1,112 @@
+
+#Comparison full cohort vs IHC cohorts
+
+```{r}
+library(gtsummary)
+library(dplyr)
+
+# ============================================================================
+# 1. Build inclusion flags on the FULL cohort (HPV-independent, deconvolution cohort)
+#    TP53status_clinical_HPVind = full cohort (same one joined into analysis_data)
+#    CD123_5$Case_ID / CD163$Case_ID = cases with IHC performed
+# ============================================================================
+
+cohort_data <- TP53status_clinical_HPVind %>%
+  mutate(
+    CD123_included = factor(
+      ifelse(id %in% CD123_5$Case_ID, "Included", "Excluded"),
+      levels = c("Excluded", "Included")
+    ),
+    CD163_included = factor(
+      ifelse(id %in% CD163$Case_ID, "Included", "Excluded"),
+      levels = c("Excluded", "Included")
+    )
+  )
+
+# Sanity check on group sizes
+table(cohort_data$CD123_included)
+table(cohort_data$CD163_included)
+
+# ============================================================================
+# 2. Same variables / typing as your original descriptive table
+# ============================================================================
+
+vars_of_interest <- c(
+"age", "figo_ini_ava", "tumor_size_category",
+"depth_invasion_category", "hist_type_category", "vli",
+  "nodal_status", "margins", "radiotherapy", "surgery_type_category", "death_disease_60m", 
+  "recurrence_60m"
+)
+
+type_list <- list(
+  figo_ini_ava ~ "categorical",
+  tumor_size_category ~ "categorical",
+  depth_invasion_category ~ "categorical",
+  hist_type_category ~ "categorical",
+  vli ~ "categorical",
+  nodal_status ~ "categorical",
+  margins ~ "categorical",
+  radiotherapy ~ "categorical",
+  surgery_type_category ~ "categorical",
+  recurrence_60m ~ "categorical",
+  death_disease_60m ~ "categorical"
+)
+
+# ============================================================================
+# 3. Reusable function: Included vs Excluded table with an Overall (full cohort) column
+# ============================================================================
+
+make_incl_excl_table <- function(data, by_var, vars) {
+  data %>%
+    select(all_of(c(by_var, vars))) %>%
+    tbl_summary(
+      by = all_of(by_var),
+      statistic = list(
+        all_categorical() ~ "{n} / {N} ({p}%)",
+        all_continuous()  ~ "{median} ({p25}, {p75})"
+      ),
+      type = type_list,
+      digits = list(
+        all_categorical() ~ c(0, 0, 1),
+        all_continuous()  ~ 1
+      )
+    ) %>%
+    add_overall(last = FALSE, col_label = "**Full cohort**\nN = {N}") %>%
+add_p(
+  test = list(
+    all_categorical() ~ function(data, variable, by, ...) {
+      result <- fisher.test(data[[variable]], data[[by]])
+      tibble::tibble(p.value = result$p.value)
+    },
+    all_continuous() ~ function(data, variable, by, ...) {
+      result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+      tibble::tibble(p.value = result$p.value)
+    }
+  ),
+  pvalue_fun = ~ style_pvalue(.x, digits = 3)
+    ) %>%
+    modify_header(p.value ~ "**p-value**\n(Included vs Excluded)")
+}
+
+# ============================================================================
+# 4. Build tables for CD123 and CD163
+# ============================================================================
+
+tbl_cd123 <- make_incl_excl_table(cohort_data, "CD123_included", vars_of_interest)
+tbl_cd163 <- make_incl_excl_table(cohort_data, "CD163_included", vars_of_interest)
+
+tbl_cd123
+tbl_cd163
+
+# ============================================================================
+# 5. Optional: merge side-by-side into one supplementary table
+# ============================================================================
+
+combined_table <- tbl_merge(
+  tbls = list(tbl_cd123, tbl_cd163),
+  tab_spanner = c("**CD123 validation cohort**", "**CD163 validation cohort**")
+)
+
+combined_table
+```
+

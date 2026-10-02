@@ -1,0 +1,129 @@
+
+```{r}
+load("TP53status_clinical_20250811.RData")
+```
+
+
+#Subsetting by HPV-status:Considering only HPV-independent
+```{r}
+# Subset AnnotData by HPV status
+TP53status_clinical_HPVas <- TP53status_clinical[TP53status_clinical$hpv_status == "Positive", ]
+TP53status_clinical_HPVind <- TP53status_clinical[TP53status_clinical$hpv_status == "Negative", ]
+
+#We confirm that we have the correct number of cases in each subset
+length(TP53status_clinical_HPVas$id)
+length(TP53status_clinical_HPVind$id)
+#There are n=18 HPV-Associated and n=52 HPV-Independent
+
+# Extract the 'id' values for each subset
+ids_HPV_Associated <- TP53status_clinical_HPVas$id
+ids_HPV_Independent <- TP53status_clinical_HPVind$id
+
+# Subset counts_filtered_filtered based on the IDs
+counts_HPV_Associated <- counts_filtered_filtered[, colnames(counts_filtered_filtered) %in% ids_HPV_Associated]
+counts_HPV_Independent <- counts_filtered_filtered[, colnames(counts_filtered_filtered) %in% ids_HPV_Independent]
+
+# Check results
+dim(counts_HPV_Associated)
+dim(counts_HPV_Independent)
+#There are n=18 HPV-Associated and n=52 HPV-Independent, 10513 genes
+```
+
+```{r}
+
+# ============================================================
+# R and package versions
+# ============================================================
+
+# R version
+R_version <- R.version.string
+R_version
+
+# Packages you want to check
+packages <- c(
+  "HTGAnalyzer",
+  "immunedeconv",
+  "edgeR",
+  "limma",
+  "maxstat",
+  "survival",
+  "survminer",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "broom",
+  "tibble"
+)
+
+# Check which packages are installed
+installed_packages <- rownames(installed.packages())
+
+# Create version table
+version_table <- data.frame(
+  Package = packages,
+  Installed = packages %in% installed_packages,
+  Version = sapply(packages, function(pkg) {
+    if (pkg %in% installed_packages) {
+      as.character(packageVersion(pkg))
+    } else {
+      NA_character_
+    }
+  }),
+  stringsAsFactors = FALSE
+)
+
+# Display the table
+version_table
+```
+```{r}
+sessionInfo()
+# R version 4.4.0 (2024-04-24 ucrt)
+# Platform: x86_64-w64-mingw32/x64
+# Running under: Windows 11 x64 (build 26200)
+# 
+# Matrix products: default
+# 
+# 
+# locale:
+# [1] LC_COLLATE=Spanish_Spain.utf8  LC_CTYPE=Spanish_Spain.utf8    LC_MONETARY=Spanish_Spain.utf8
+# [4] LC_NUMERIC=C                   LC_TIME=Spanish_Spain.utf8    
+# 
+# time zone: Europe/Madrid
+# tzcode source: internal
+# 
+# attached base packages:
+# [1] stats     graphics  grDevices utils     datasets  methods   base     
+# 
+# other attached packages:
+# [1] readr_2.2.0   ggplot2_4.0.2 tidyr_1.3.2   dplyr_1.2.0   edgeR_4.2.2   limma_3.60.6 
+# 
+# loaded via a namespace (and not attached):
+#   [1] gridExtra_2.3         readxl_1.4.5          rlang_1.1.7           magrittr_2.0.3       
+#   [5] clue_0.3-67           GetoptLong_1.1.0      otel_0.2.0            matrixStats_1.5.0    
+#   [9] compiler_4.4.0        getPass_0.2-4         png_0.1-9             vctrs_0.7.1          
+#  [13] stringr_1.6.0         pkgconfig_2.0.3       shape_1.4.6.1         crayon_1.5.3         
+#  [17] fastmap_1.2.0         backports_1.5.0       redcapAPI_2.11.5      labeling_0.4.3       
+#  [21] utf8_1.2.6            rmarkdown_2.30        tzdb_0.5.0            exactRankTests_0.8-36
+#  [25] bit_4.6.0             purrr_1.2.1           xfun_0.56             jsonlite_2.0.0       
+#  [29] broom_1.0.12          parallel_4.4.0        cluster_2.1.8.2       R6_2.6.1             
+#  [33] stringi_1.8.7         RColorBrewer_1.1-3    car_3.1-5             cellranger_1.1.0     
+#  [37] lubridate_1.9.5       Rcpp_1.0.14           iterators_1.0.14      knitr_1.51           
+#  [41] IRanges_2.38.1        Matrix_1.7-0          splines_4.4.0         timechange_0.4.0     
+#  [45] tidyselect_1.2.1      rstudioapi_0.18.0     dichromat_2.0-0.1     abind_1.4-8          
+#  [49] yaml_2.3.12           doParallel_1.0.17     codetools_0.2-20      curl_7.0.0           
+#  [53] lattice_0.22-6        tibble_3.2.1          withr_3.0.2           S7_0.2.1             
+#  [57] evaluate_1.0.5        survival_3.8-6        zip_2.3.3             circlize_0.4.17      
+#  [61] pillar_1.11.1         ggpubr_0.6.3          filelock_1.0.3        carData_3.0-6        
+#  [65] checkmate_2.3.4       foreach_1.5.2         stats4_4.4.0          generics_0.1.4       
+#  [69] vroom_1.7.0           S4Vectors_0.42.1      hms_1.1.4             scales_1.4.0         
+#  [73] sodium_1.4.0          chron_2.3-62          glue_1.8.0            survminer_0.5.2      
+#  [77] tools_4.4.0           openxlsx_4.2.8.1      locfit_1.5-9.12       ggsignif_0.6.4       
+#  [81] mvtnorm_1.3-6         grid_4.4.0            cards_0.7.1           colorspace_2.1-1     
+#  [85] maxstat_0.7-26        Formula_1.2-5         cli_3.6.2             gtsummary_2.5.0      
+#  [89] rappdirs_0.3.4        labelVector_0.1.2     ComplexHeatmap_2.20.0 gtable_0.3.6         
+#  [93] rstatix_0.7.3         digest_0.6.35         BiocGenerics_0.50.0   rjson_0.2.23         
+#  [97] farver_2.1.2          htmltools_0.5.8.1     lifecycle_1.0.5       GlobalOptions_0.1.3  
+# [101] shelter_0.2.1         statmod_1.5.1         mime_0.13             bit64_4.6.0-1 
+```
+
+

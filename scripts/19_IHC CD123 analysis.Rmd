@@ -1,0 +1,2029 @@
+
+#Validation IHC CD123
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(gridExtra)
+library(scales)
+```
+
+```{r}
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c( "Sample"="id"))
+```
+
+
+```{r}
+CD123_5 <- read_excel("Validation_CD123.xlsx", 
+    col_types = c("text", "numeric", "numeric", "numeric", "text"))
+
+CD123_5 <- CD123_5 %>%
+  select(-Observations)   # Remove the "Observations" column
+
+
+# View cleaned dataset
+print(CD123_5)
+
+
+# Subset data for Plasmacytoid dendritic cell
+plasmacytoid_data <- analysis_data %>% 
+  filter(cell_type == "Plasmacytoid dendritic cell")
+
+#We check the ones that are not in the other dataset:
+#Find which IDs are in CD123_3nd$Case_ID but not in plasmacytoid_data$Sample
+#setdiff(CD123_3nd$Case_ID, plasmacytoid_data$Sample)
+
+setdiff(CD123_5$Case_ID, plasmacytoid_data$Sample)
+
+#Find which IDs are in plasmacytoid_data$Sample but not in CD123_3nd$Case_ID
+#setdiff(plasmacytoid_data$Sample, CD123_3nd$Case_ID)
+
+setdiff(plasmacytoid_data$Sample, CD123_5$Case_ID)
+#9 cases
+
+```
+
+
+
+```{r}
+#We merge it by merge(): Only IDs common to both datasets will be included.Any IDs that exist only in CD123_5 or only in plasmacytoid_data will be excluded from merged_data
+
+merged_data <- merge(CD123_5, plasmacytoid_data, 
+                     by.x = "Case_ID", by.y = "Sample")
+
+```
+
+
+
+
+```{r}
+# Use anti_join to get cases from CD123 that don't have a match in "Plasmacytoid dendritic cell"
+unmatched_cases <- CD123_5 %>%
+  anti_join(plasmacytoid_data, by = c("Case_ID" = "Sample"))
+
+# View the unmatched cases
+print(unmatched_cases)
+nrow(unmatched_cases)
+
+# Use inner_join to confirm which CD123 cases have matching clinical data
+matched_cases <- CD123_5 %>%
+  inner_join(TP53status_clinical_HPVind, by = c("Case_ID" = "id"))
+
+# View the unmatched cases
+print(matched_cases)
+nrow(matched_cases)
+```
+
+```{r}
+# Use anti_join to get cases from  "Plasmacytoid dendritic cell" that don't have a match in CD123
+unmatched_cases <- plasmacytoid_data %>%
+  anti_join(CD123_5, by = c("Sample"="Case_ID"))
+
+# View the unmatched cases
+print(unmatched_cases)
+
+
+# Use anti_join to get cases from  "Plasmacytoid dendritic cell" that don't have a match in CD123
+unmatched_cases <- plasmacytoid_data %>%
+  anti_join(merged_data, by = c("Sample"="Case_ID"))
+
+# View the unmatched cases
+print(unmatched_cases)
+```
+
+```{r}
+
+# ============================================================
+# 0. Compute Wilcoxon p-values across all 3 CD123 compartments
+#    + BH-FDR correction (mirrors the PDL1/xCell approach)
+# ============================================================
+
+library(ggplot2)
+library(ggpubr)
+
+compartments_p53 <- c(
+  "Positive_cells_tumoral_area",
+  "Positive_cells_tumor_stroma",
+  "Positive_cells_perivascular_areas"
+)
+
+results_p53_cd123 <- lapply(compartments_p53, function(var) {
+  test_result <- wilcox.test(
+    merged_data[[var]] ~ merged_data$p53_ihc_status
+  )
+  data.frame(
+    compartment = var,
+    p_value = test_result$p.value,
+    median_Wt = median(merged_data[[var]][merged_data$p53_ihc_status == "Wt"], na.rm = TRUE),
+    median_Mutant = median(merged_data[[var]][merged_data$p53_ihc_status == "Mutant"], na.rm = TRUE)
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    FDR = p.adjust(p_value, method = "BH"),
+    FDR_label = paste0("FDR = ", format.pval(FDR, digits = 2, eps = 0.001))
+  )
+
+# View corrected results
+results_p53_cd123
+
+
+# ============================================================
+# 1. Define colors for p53 status (color-blind–friendly)
+# ============================================================
+
+p53_colors_fill <- c(
+  "Wt"     = "#41AE76",  # dark green
+  "Mutant" = "#79419D"   # dark purple
+)
+
+p53_colors_color <- c(
+  "Wt"     = "#2B6B4A",  # lighter green for points
+  "Mutant" =  "#4F2E6F"  # lighter purple for points
+)
+
+# Ensure Wt is first
+merged_data$p53_ihc_status <- factor(merged_data$p53_ihc_status,
+                                     levels = c("Wt", "Mutant"))
+
+
+# ============================================================
+# 2. Boxplots with nominal p (Wilcoxon) + BH-FDR label
+# ============================================================
+
+fdr_tumoral <- results_p53_cd123$FDR_label[results_p53_cd123$compartment == "Positive_cells_tumoral_area"]
+
+ggplot(merged_data, aes(x = p53_ihc_status, y = Positive_cells_tumoral_area, fill = p53_ihc_status)) +
+  geom_boxplot(aes(color = p53_ihc_status), outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(aes(color = p53_ihc_status), width = 0.2, size = 2, alpha = 0.8) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    comparisons = list(c("Wt", "Mutant")),
+    label.y = max(merged_data$Positive_cells_tumoral_area) * 1.05
+  ) +
+  annotate("text", x = 1.5, y = max(merged_data$Positive_cells_tumoral_area) * 1.15,
+           label = fdr_tumoral, size = 4) +
+  scale_fill_manual(values = p53_colors_fill) +
+  scale_color_manual(values = p53_colors_color) +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = "p53 IHC Status",
+    y = "Fraction",
+    title = "Fraction by p53 Mutation Status with Wilcoxon Test_Tumor area"
+  ) +
+  theme(legend.position = "none")
+
+
+
+fdr_stroma <- results_p53_cd123$FDR_label[results_p53_cd123$compartment == "Positive_cells_tumor_stroma"]
+
+ggplot(merged_data, aes(x = p53_ihc_status, y = Positive_cells_tumor_stroma, fill = p53_ihc_status)) +
+  geom_boxplot(aes(color = p53_ihc_status), outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(aes(color = p53_ihc_status), width = 0.2, size = 2, alpha = 0.8) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    comparisons = list(c("Wt", "Mutant")),
+    label.y = max(merged_data$Positive_cells_tumor_stroma) * 1.05
+  ) +
+  annotate("text", x = 1.5, y = max(merged_data$Positive_cells_tumor_stroma) * 1.15,
+           label = fdr_stroma, size = 4) +
+  scale_fill_manual(values = p53_colors_fill) +
+  scale_color_manual(values = p53_colors_color) +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = "p53 IHC Status",
+    y = "Positive cells (tumor + stroma)",
+    title = "Positive cells in tumor_stroma by p53 Mutation Status"
+  ) +
+  theme(legend.position = "none")
+
+
+
+fdr_perivasc <- results_p53_cd123$FDR_label[results_p53_cd123$compartment == "Positive_cells_perivascular_areas"]
+
+ggplot(merged_data, aes(x = p53_ihc_status, y = Positive_cells_perivascular_areas, fill = p53_ihc_status)) +
+  geom_boxplot(aes(color = p53_ihc_status), outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(aes(color = p53_ihc_status), width = 0.2, size = 2, alpha = 0.8) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    comparisons = list(c("Wt", "Mutant")),
+    label.y = max(merged_data$Positive_cells_perivascular_areas) * 1.05
+  ) +
+  annotate("text", x = 1.5, y = max(merged_data$Positive_cells_perivascular_areas) * 1.15,
+           label = fdr_perivasc, size = 4) +
+  scale_fill_manual(values = p53_colors_fill) +
+  scale_color_manual(values = p53_colors_color) +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = "p53 IHC Status",
+    y = "Positive cells (perivascular)",
+    title = "Positive cells in perivascular areas by p53 Mutation Status"
+  ) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r}
+# Ensure categorical variables are factors
+merged_data <- merged_data %>%
+  mutate(
+    hpv_status = factor(hpv_status)
+  )
+```
+
+
+
+
+#DEATH
+```{r}
+# ============================================================================
+# CD123 IHC SURVIVAL ANALYSIS
+# DSS + RFS
+# maxstat + median + continuous
+# ============================================================================
+
+ihc_data <- merged_data %>%
+  mutate(
+    figo_ini_ava = relevel(
+      factor(figo_ini_ava),
+      ref = "1 (Advanced)"
+    ),
+    p53_ihc_status = relevel(
+      factor(p53_ihc_status),
+      ref = "Mutant"
+    )
+  )
+
+# CD123 IHC markers / compartments
+compartments <- c(
+  "Positive_cells_tumoral_area",
+  "Positive_cells_tumor_stroma",
+  "Positive_cells_perivascular_areas"
+)
+
+# Covariates used in the CD123 multivariable models
+covariates_full <- c(
+  "figo_ini_ava",
+  "p53_ihc_status"
+)
+```
+
+```{r}
+# ============================================================================
+# SHARED HELPERS
+# ============================================================================
+
+check_convergence <- function(model, maxit_val) {
+  n_iter <- model$iter
+  !is.null(n_iter) &&
+    all(n_iter < maxit_val) &&
+    is.finite(sum(model$coefficients))
+}
+
+find_maxstat_cutoff_ihc <- function(time_var, event_var, marker_var, data) {
+  d <- data[!is.na(data[[marker_var]]) & !is.na(data[[time_var]]) & !is.na(data[[event_var]]), ]
+  n <- nrow(d)
+  if (n < 10) return(NA_real_)
+
+  fmla <- as.formula(paste0("survival::Surv(", time_var, ", ", event_var, ") ~ ", marker_var))
+  MAXSTAT <- tryCatch(
+    maxstat::maxstat.test(fmla, data = d, smethod = "LogRank", pmethod = "Lau92",
+                           iscores = TRUE, minprop = 0.2, maxprop = 0.8),
+    error = function(e) NA
+  )
+  if (isTRUE(is.na(MAXSTAT))) return(NA_real_)
+  MAXSTAT$estimate
+}
+
+add_threshold_groups_ihc <- function(df, time_var, event_var, marker_var) {
+  cutoff_maxstat <- tryCatch(
+    find_maxstat_cutoff_ihc(time_var, event_var, marker_var, df),
+    error = function(e) NA_real_
+  )
+  cutoff_median <- median(df[[marker_var]], na.rm = TRUE)
+
+  df %>%
+    mutate(
+      Group_maxstat = ifelse(!is.na(cutoff_maxstat) & .data[[marker_var]] > cutoff_maxstat,
+                              "High", "Low"),
+      Group_median  = ifelse(.data[[marker_var]] > cutoff_median, "High", "Low")
+    )
+}
+
+
+make_cutoff_table_ihc <- function(data, markers, time_var, event_var) {
+  bind_rows(lapply(markers, function(m) {
+    d  <- data %>% filter(!is.na(.data[[m]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+    ev <- as.numeric(as.character(d[[event_var]]))
+  cuts <- c(maxstat = unname(find_maxstat_cutoff_ihc(time_var, event_var, m, d)),
+              median  = median(d[[m]], na.rm = TRUE))
+    bind_rows(lapply(names(cuts), function(tt) {
+      high <- !is.na(cuts[[tt]]) & d[[m]] > cuts[[tt]]
+      data.frame(marker = m, threshold_type = tt,
+                 cutoff = signif(cuts[[tt]], 3),
+                 `n (Low/High)`      = paste0(sum(!high), "/", sum(high)),
+                 `Events (Low/High)` = paste0(sum(ev[!high] == 1), "/", sum(ev[high] == 1)),
+                 check.names = FALSE)
+    }))
+  }))
+}
+
+add_cutoffs_ihc <- function(tab, cutoff_table) {
+  tab <- tab %>%
+    left_join(cutoff_table, by = c("marker", "threshold_type")) %>%
+    relocate(cutoff, `n (Low/High)`, `Events (Low/High)`, .after = threshold_type)
+  if ("Variable" %in% names(tab)) {
+    keep <- grepl("^Enrichment", tab$Variable)
+    tab[!keep, c("cutoff", "n (Low/High)", "Events (Low/High)")] <- NA
+  }
+  tab$converged <- ifelse(tab$converged, "Yes", "No")
+  tab
+}
+
+covariates_full <- c("figo_ini_ava", "p53_ihc_status")
+
+compartments <- c(
+  "Positive_cells_tumoral_area",
+  "Positive_cells_tumor_stroma",
+  "Positive_cells_perivascular_areas"
+)
+```
+
+
+
+```{r}
+# ============================================================================
+# DSS -- UNIVARIATE
+# ============================================================================
+
+run_cox_DSS_ihc_group <- function(marker_label, marker_var, exposure_var, threshold_label,
+                                   data, maxit_val = 100000) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_death_surv_60m", "death_disease_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+  df0 <- df0 %>% filter(!is.na(.data[[exposure_var]]), !is.na(death_disease_60m), !is.na(time_death_surv_60m))
+
+  fmla <- as.formula(paste0("Surv(time_death_surv_60m, death_disease_60m) ~ ", exposure_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, threshold_type = threshold_label,
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, threshold_type = threshold_label,
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+run_cox_DSS_ihc_continuous <- function(marker_label, marker_var, data, maxit_val = 100000) {
+
+  df0 <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(death_disease_60m), !is.na(time_death_surv_60m))
+
+  fmla <- as.formula(paste0("Surv(time_death_surv_60m, death_disease_60m) ~ ", marker_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, threshold_type = "continuous",
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, threshold_type = "continuous",
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+univ_DSS_maxstat_ihc <- bind_rows(
+  lapply(compartments, function(marker) {
+    run_cox_DSS_ihc_group(marker, marker, "Group_maxstat", "maxstat", ihc_data)
+  })
+)
+
+univ_DSS_median_ihc <- bind_rows(
+  lapply(compartments, function(marker) {
+    run_cox_DSS_ihc_group(marker, marker, "Group_median", "median", ihc_data)
+  })
+)
+
+univ_DSS_continuous_ihc <- bind_rows(
+  lapply(compartments, function(marker) {
+    run_cox_DSS_ihc_continuous(marker, marker, ihc_data)
+  })
+)
+
+univ_DSS_ihc_all <- bind_rows(univ_DSS_maxstat_ihc, univ_DSS_median_ihc, univ_DSS_continuous_ihc) %>%
+  group_by(threshold_type) %>%
+  mutate(p_adj_BH = p.adjust(pval, method = "BH")) %>%
+  ungroup()
+
+univ_DSS_ihc_formatted <- univ_DSS_ihc_all %>%
+  mutate(
+    HR_CI = sprintf("%.3f (%.3f\u2013%.3f)", HR, lower_095, upper_095),
+    pval = round(pval, 4),
+    p_adj_BH = round(p_adj_BH, 4)
+  ) %>%
+  select(marker, threshold_type, HR_CI, pval, p_adj_BH, n, n_events, n_iter, converged) %>%
+  arrange(marker, threshold_type)
+
+cutoffs_DSS_cd123 <- make_cutoff_table_ihc(ihc_data, compartments,
+                                           "time_death_surv_60m", "death_disease_60m")
+cutoffs_DSS_cd123
+
+univ_DSS_ihc_formatted <- add_cutoffs_ihc(univ_DSS_ihc_formatted, cutoffs_DSS_cd123)
+kable(univ_DSS_ihc_formatted)
+```
+
+
+
+
+
+```{r}
+# ============================================================================
+# DSS -- SELECT MARKERS FOR MULTIVARIATE
+# ============================================================================
+
+selected_DSS_ihc <- univ_DSS_ihc_all %>%
+  filter(!is.na(p_adj_BH), p_adj_BH < 0.10) %>%
+  pull(marker) %>%
+  unique()
+
+cat("CD123 markers entering ALL DSS multivariable models:\n")
+print(selected_DSS_ihc)
+```
+
+
+
+```{r}
+# ============================================================================
+# DSS -- MULTIVARIATE MAXSTAT / MEDIAN
+# adjusted for FIGO + p53
+# ============================================================================
+
+perform_cox_DSS_ihc_multiv <- function(marker_label, marker_var, exposure_var,
+                                        data, covariates, maxit_val = 100000) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_death_surv_60m", "death_disease_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+
+  df0 <- df0 %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(death_disease_60m), !is.na(time_death_surv_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, variable = NA_character_, coef = NA_real_, HR = NA_real_,
+      lower_095 = NA_real_, upper_095 = NA_real_, pval = NA_real_,
+      n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients), HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower), upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+multiv_DSS_maxstat_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(lapply(selected_DSS_ihc, function(marker) {
+    perform_cox_DSS_ihc_multiv(marker, marker, "Group_maxstat", ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_DSS_maxstat_ihc) > 0) {
+  multiv_DSS_maxstat_ihc <- multiv_DSS_maxstat_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- grepl("^Group_maxstat", multiv_DSS_maxstat_ihc$variable)
+  multiv_DSS_maxstat_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_DSS_maxstat_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+
+multiv_DSS_median_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(lapply(selected_DSS_ihc, function(marker) {
+    perform_cox_DSS_ihc_multiv(marker, marker, "Group_median", ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_DSS_median_ihc) > 0) {
+  multiv_DSS_median_ihc <- multiv_DSS_median_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- grepl("^Group_median", multiv_DSS_median_ihc$variable)
+  multiv_DSS_median_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_DSS_median_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+multiv_DSS_maxstat_ihc <- multiv_DSS_maxstat_ihc %>% mutate(threshold_type = "maxstat", .after = marker)
+multiv_DSS_median_ihc  <- multiv_DSS_median_ihc  %>% mutate(threshold_type = "median",  .after = marker)
+
+# ============================================================================
+# DSS -- MULTIVARIATE CONTINUOUS
+# ============================================================================
+
+perform_cox_DSS_ihc_multiv_continuous <- function(marker_label, marker_var,
+                                                    data, covariates, maxit_val = 100000) {
+
+  df0 <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(death_disease_60m), !is.na(time_death_surv_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    paste(c(marker_var, covariates), collapse = " + ")
+  ))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, variable = NA_character_, coef = NA_real_, HR = NA_real_,
+      lower_095 = NA_real_, upper_095 = NA_real_, pval = NA_real_,
+      n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients), HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower), upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0), n_events = sum(df0$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+multiv_DSS_continuous_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(lapply(selected_DSS_ihc, function(marker) {
+    perform_cox_DSS_ihc_multiv_continuous(marker, marker, ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_DSS_continuous_ihc) > 0) {
+  multiv_DSS_continuous_ihc <- multiv_DSS_continuous_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- multiv_DSS_continuous_ihc$variable == multiv_DSS_continuous_ihc$marker
+  multiv_DSS_continuous_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_DSS_continuous_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+multiv_DSS_continuous_ihc <- multiv_DSS_continuous_ihc %>%
+  mutate(threshold_type = "continuous", .after = marker)
+
+# ----------------------------------------------------------------------------
+# Combine maxstat + median + continuous
+# ----------------------------------------------------------------------------
+
+multiv_DSS_ihc_all <- bind_rows(
+  multiv_DSS_maxstat_ihc,
+  multiv_DSS_median_ihc,
+  multiv_DSS_continuous_ihc
+)
+
+format_table_DSS_ihc <- function(df) {
+  df %>%
+    mutate(
+      variable_label = case_when(
+        grepl("^Group_", variable) ~ "Enrichment (High vs Low)",
+        variable == marker ~ "Continuous (per unit)",
+        variable == "figo_ini_ava0 (Initial)" ~ "FIGO (Initial)",
+        variable == "p53_ihc_statusWt" ~ "p53 (Normal)",
+        TRUE ~ variable
+      ),
+      HR_CI = sprintf("%.4f (%.4f\u2013%.4f)", HR, lower_095, upper_095),
+      coef = round(coef, 4), pval = round(pval, 4), p_adj_BH = round(p_adj_BH, 4)
+    ) %>%
+    select(marker, threshold_type, Variable = variable_label, Coef = coef,
+           `HR (95% CI)` = HR_CI, `p-value` = pval, `p (BH-adj)` = p_adj_BH,
+           n, n_events, n_iter, converged)
+}
+
+multiv_DSS_ihc_formatted <- format_table_DSS_ihc(multiv_DSS_ihc_all) %>%
+  arrange(marker, threshold_type)
+
+
+multiv_DSS_ihc_formatted <- add_cutoffs_ihc(multiv_DSS_ihc_formatted, cutoffs_DSS_cd123)
+
+kable(multiv_DSS_ihc_formatted, caption = "Multivariate Firth Cox regression for DSS: CD123 IHC")
+```
+
+
+```{r}
+# ============================================================================
+# DSS -- PROPORTIONAL HAZARDS ASSUMPTION
+# ============================================================================
+
+check_ph_DSS_ihc <- function(marker_label, marker_var, data, exposure_var, covariates) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_death_surv_60m", "death_disease_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+
+  d <- df0 %>%
+    mutate(death_disease_60m = as.numeric(as.character(death_disease_60m))) %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(figo_ini_ava), !is.na(p53_ihc_status)) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(data.frame(marker = marker_label, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "coxph_fit_failed"))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(marker = marker_label, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "zph_failed"))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(
+    marker = marker_label, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+    p = round(tab$p, 4), global_p = round(global_p, 4), note = NA_character_
+  )
+}
+
+
+check_ph_DSS_ihc_continuous <- function(marker_label, marker_var, data, covariates) {
+
+  d <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(time_death_surv_60m), !is.na(death_disease_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    mutate(death_disease_60m = as.numeric(as.character(death_disease_60m))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    marker_var, " + ", paste(covariates, collapse = " + ")
+  ))
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(data.frame(marker = marker_label, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "coxph_fit_failed"))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(marker = marker_label, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "zph_failed"))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(
+    marker = marker_label, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+    p = round(tab$p, 4), global_p = round(global_p, 4), note = NA_character_
+  )
+}
+
+ph_DSS_maxstat_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(
+    lapply(selected_DSS_ihc, function(m) check_ph_DSS_ihc(m, m, ihc_data, "Group_maxstat", covariates_full))
+  ) %>% mutate(threshold_type = "maxstat", .after = marker)
+} else data.frame()
+
+ph_DSS_median_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(
+    lapply(selected_DSS_ihc, function(m) check_ph_DSS_ihc(m, m, ihc_data, "Group_median", covariates_full))
+  ) %>% mutate(threshold_type = "median", .after = marker)
+} else data.frame()
+
+
+ph_DSS_continuous_ihc <- if (length(selected_DSS_ihc) > 0) {
+  bind_rows(
+    lapply(selected_DSS_ihc, function(m) check_ph_DSS_ihc_continuous(m, m, ihc_data, covariates_full))
+  ) %>% mutate(threshold_type = "continuous", .after = marker)
+} else data.frame()
+
+ph_DSS_ihc_all <- bind_rows(ph_DSS_maxstat_ihc, ph_DSS_median_ihc, ph_DSS_continuous_ihc) %>%
+  arrange(marker, threshold_type, term)
+
+kable(ph_DSS_ihc_all)
+```
+
+
+```{r}
+# ============================================================================
+# DSS BOOTSTRAP OPTIMISM CORRECTION
+# ============================================================================
+
+sig_maxstat_DSS_ihc <- multiv_DSS_maxstat_ihc %>%
+  filter(grepl("^Group_maxstat", variable), p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+sig_median_DSS_ihc <- multiv_DSS_median_ihc %>%
+  filter(grepl("^Group_median", variable), p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+sig_continuous_DSS_ihc <- multiv_DSS_continuous_ihc %>%
+  filter(variable == marker, p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+cat("DSS maxstat models for bootstrap:\n"); print(sig_maxstat_DSS_ihc)
+cat("\nDSS median models for bootstrap:\n"); print(sig_median_DSS_ihc)
+cat("\nDSS continuous models for bootstrap:\n"); print(sig_continuous_DSS_ihc)
+```
+
+
+```{r}
+get_cutoff_DSS_ihc <- function(threshold_type, marker_var, data) {
+  if (threshold_type == "maxstat") {
+    find_maxstat_cutoff_ihc("time_death_surv_60m", "death_disease_60m", marker_var, data)
+  } else {
+    median(data[[marker_var]], na.rm = TRUE)
+  }
+}
+
+bootstrap_cutoff_DSS_ihc <- function(marker_val,
+                                      threshold_type,
+                                      data,
+                                      covariates,
+                                      B = 1000,
+                                      maxit_boot = 500,
+                                      maxstep_boot = 0.5,
+                                      seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data[!is.na(data[[marker_val]]) &
+                !is.na(data$time_death_surv_60m) &
+                !is.na(data$death_disease_60m), ]
+
+  cutoff0 <- get_cutoff_DSS_ihc(threshold_type, marker_val, df0)
+  if (is.na(cutoff0)) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "cutoff_not_found"))
+  }
+
+  df0$Group <- factor(ifelse(df0[[marker_val]] > cutoff0, "High", "Low"), levels = c("Low", "High"))
+  if (nlevels(droplevels(df0$Group)) < 2) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "single_group"))
+  }
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ Group + ", paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("GroupHigh" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["GroupHigh"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    cutoff_b <- get_cutoff_DSS_ihc(threshold_type, marker_val, dboot)
+    if (is.na(cutoff_b)) next
+
+    dboot$Group <- factor(ifelse(dboot[[marker_val]] > cutoff_b, "High", "Low"), levels = c("Low", "High"))
+    if (nlevels(droplevels(dboot$Group)) < 2) next
+    ev_tab_boot <- table(dboot$Group, dboot$death_disease_60m)
+    if (ncol(ev_tab_boot) < 2 || any(ev_tab_boot[, 2] == 0)) next
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("GroupHigh" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["GroupHigh"])
+
+    df_test <- df0
+    df_test$Group <- factor(ifelse(df_test[[marker_val]] > cutoff_b, "High", "Low"), levels = c("Low", "High"))
+    if (nlevels(droplevels(df_test$Group)) < 2) next
+    ev_tab_test <- table(df_test$Group, df_test$death_disease_60m)
+    if (ncol(ev_tab_test) < 2 || any(ev_tab_test[, 2] == 0)) next
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df_test, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("GroupHigh" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["GroupHigh"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = exp(beta_apparent), HR_corrected = NA,
+                       HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+                       B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+                       elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    marker = marker_val, threshold_type = threshold_type,
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1), error = NA_character_
+  )
+}
+
+# Only markers where the enrichment term reached p.adj<0.05 in the apparent model,
+# both thresholds bootstrapped for comparison -- same rule as xCell
+
+boot_DSS_ihc_maxstat <- if (length(sig_maxstat_DSS_ihc) > 0) {
+  bind_rows(lapply(sig_maxstat_DSS_ihc, bootstrap_cutoff_DSS_ihc,
+                    threshold_type = "maxstat", data = ihc_data,
+                    covariates = covariates_full, B = 1000))
+} else data.frame()
+
+boot_DSS_ihc_median <- if (length(sig_median_DSS_ihc) > 0) {
+  bind_rows(lapply(sig_median_DSS_ihc, bootstrap_cutoff_DSS_ihc,
+                    threshold_type = "median", data = ihc_data,
+                    covariates = covariates_full, B = 1000))
+} else data.frame()
+
+```
+
+
+```{r}
+# ============================================================================
+# CONTINUOUS DSS BOOTSTRAP
+# ============================================================================
+
+bootstrap_continuous_DSS_ihc <- function(marker_val,
+                                         data,
+                                         covariates,
+                                         B = 1000,
+                                         maxit_boot = 500,
+                                         maxstep_boot = 0.5,
+                                         seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_val]]),
+      !is.na(time_death_surv_60m),
+      !is.na(death_disease_60m),
+      if_all(all_of(covariates), ~ !is.na(.))
+    ) %>%
+    droplevels()
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ", marker_val, " + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !(marker_val %in% names(fit_apparent$coefficients))) {
+    return(data.frame(marker = marker_val, threshold_type = "continuous",
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients[marker_val])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !(marker_val %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients[marker_val])
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df0, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !(marker_val %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients[marker_val])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(marker = marker_val, threshold_type = "continuous",
+                       HR_apparent = exp(beta_apparent), HR_corrected = NA,
+                       HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+                       B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+                       elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    marker = marker_val, threshold_type = "continuous",
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+boot_DSS_ihc_continuous <- if (length(sig_continuous_DSS_ihc) > 0) {
+  bind_rows(lapply(sig_continuous_DSS_ihc, bootstrap_continuous_DSS_ihc,
+                    data = ihc_data, covariates = covariates_full, B = 1000))
+} else data.frame()
+
+boot_DSS_ihc_all <- bind_rows(boot_DSS_ihc_maxstat, boot_DSS_ihc_median, boot_DSS_ihc_continuous) %>%
+  arrange(marker, threshold_type)
+
+kable(boot_DSS_ihc_all, caption = "Bootstrap optimism correction for multivariable DSS models: CD123 IHC")
+```
+
+
+
+#Visualitzation
+```{r}
+# ============================================================================
+# Shared helper: builds a sensible plotting order from whatever markers are
+# actually present, instead of a hardcoded vector. Mirrors build_cell_type_order()
+# from the xCell script, renamed for markers. Defined once here; reused as-is
+# in the RFS-IHC visualization block below.
+# ============================================================================
+
+build_marker_order <- function(markers) {
+  markers <- unique(markers)
+  is_score <- grepl("score", markers, ignore.case = TRUE)
+  ordered <- c(sort(markers[is_score]), sort(markers[!is_score]))
+  rev(ordered)
+}
+```
+
+
+
+#corrected forest plot
+
+```{r}
+# ============================================================================
+# FOREST PLOT -- DSS (CD123 IHC), maxstat vs. median, bootstrap-corrected HRs
+# ============================================================================
+
+library(ggplot2)
+
+make_optimism_forest_ihc <- function(boot_df, multiv_df, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(marker, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- boot_df %>%
+    filter(!is.na(HR_corrected), threshold_type %in% c("maxstat", "median")) %>%
+    left_join(sig_df, by = c("marker", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    )
+
+  marker_order <- build_marker_order(df$marker)
+  df <- df %>% mutate(marker = factor(marker, levels = marker_order))
+
+  ggplot(df, aes(x = marker, y = HR_corrected, color = threshold_type,
+                  shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = HR_corrected_lower, ymax = HR_corrected_upper),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"),
+                        name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."),
+                        name = "Significance\n(apparent model)") +
+    labs(title = title, x = "", y = "Bootstrap-corrected Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DSS_ihc_corrected <- make_optimism_forest_ihc(
+  boot_DSS_ihc_all, multiv_DSS_ihc_formatted,
+  "DSS \u2014 CD123 IHC, bootstrap-corrected HRs, maxstat vs. median"
+)
+forest_DSS_ihc_corrected
+```
+
+
+#uncorrected
+```{r}
+# ============================================================================
+# FOREST PLOT -- DSS (CD123 IHC), maxstat vs. median, NON-BOOTSTRAP HRs
+# Mirrors make_forest_combined() from the xCell script, cell_type -> marker.
+# marker_order is derived from multiv_DSS_ihc_all itself, so every marker that
+# entered the multivariate stage (p_adj<0.1 in univariate, either threshold)
+# is guaranteed to appear.
+# ============================================================================
+
+make_forest_ihc <- function(multiv_df, multiv_raw, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(marker, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- multiv_raw %>%
+    filter(variable %in% c("Group_maxstatHigh", "Group_medianHigh")) %>%
+    left_join(sig_df, by = c("marker", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    ) %>%
+    filter(!is.na(HR), !is.na(lower_095), !is.na(upper_095))
+
+  marker_order <- build_marker_order(df$marker)
+  df <- df %>% mutate(marker = factor(marker, levels = marker_order))
+
+  ggplot(df, aes(x = marker, y = HR, color = threshold_type, shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = lower_095, ymax = upper_095),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"), name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."), name = "Significance") +
+    labs(title = title, x = "", y = "Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DSS_ihc_unadjusted <- make_forest_ihc(
+  multiv_df  = multiv_DSS_ihc_formatted,
+  multiv_raw = multiv_DSS_ihc_all,
+  title = "DSS \u2014 CD123 IHC, multivariable HRs, maxstat vs. median"
+)
+
+forest_DSS_ihc_unadjusted
+```
+
+
+#kaplan meiers
+```{r}
+# ============================================================================
+# KAPLAN-MEIER -- DSS by CD123 enrichment (maxstat and median)
+# Mirrors plot_km() from the xCell script. Unlike the xCell version, this
+# does NOT need to run before the RFS section, because add_threshold_groups_ihc()
+# recomputes Group_maxstat/Group_median fresh on every call rather than relying
+# on columns pre-attached to a shared analysis_data -- no ordering dependency.
+# ============================================================================
+
+plot_km_ihc <- function(data, marker_var, time_var, event_var, group_var, title) {
+
+  df0 <- add_threshold_groups_ihc(data, time_var, event_var, marker_var)
+  df0[[event_var]] <- as.numeric(as.character(df0[[event_var]]))
+  df0[[group_var]] <- droplevels(factor(df0[[group_var]], levels = c("Low", "High")))
+  df0 <- df0 %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+
+  grp_counts <- table(df0[[group_var]])
+  if (any(grp_counts == 0) || length(grp_counts) < 2) {
+    stop(sprintf(
+      "Cannot build KM plot for '%s' / %s: group counts are %s.",
+      marker_var, group_var, paste(names(grp_counts), grp_counts, sep = "=", collapse = ", ")
+    ))
+  }
+
+  fmla <- as.formula(paste0("Surv(", time_var, ", ", event_var, ") ~ ", group_var))
+  fit <- survminer::surv_fit(fmla, data = df0)
+
+  ggsurvplot(
+    fit, data = df0, pval = TRUE, risk.table = TRUE,
+    legend.title = paste(marker_var, "enrichment"), legend.labs = c("Low", "High"),
+    title = title, palette = c("gray50", "black"),
+    xlab = "Time (months)", ylab = "Survival probability"
+  )
+}
+
+# One KM pair per marker that reached significance in the apparent multivariate
+# model (mirrors using "Plasmacytoid dendritic cell" as the single significant
+# xCell hit; here there may be more than one CD123 compartment).
+km_dss_ihc_maxstat <- lapply(sig_maxstat_DSS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_death_surv_60m", "death_disease_60m", "Group_maxstat",
+              paste0("DSS by ", m, " enrichment (maxstat)"))
+})
+
+km_dss_ihc_median <- lapply(sig_median_DSS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_death_surv_60m", "death_disease_60m", "Group_median",
+              paste0("DSS by ", m, " enrichment (median)"))
+})
+
+km_dss_ihc_maxstat
+km_dss_ihc_median
+```
+
+
+
+
+
+
+
+
+
+
+
+
+#RECURRENCE
+```{r}
+# ============================================================================
+# RFS (RECURRENCE) -- CD123 IHC
+# ============================================================================
+
+run_cox_RFS_ihc_group <- function(marker_label, marker_var, exposure_var, threshold_label,
+                                   data, maxit_val = 100000) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_recurrence_surv_60m", "recurrence_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+  df0 <- df0 %>% filter(!is.na(.data[[exposure_var]]), !is.na(recurrence_60m), !is.na(time_recurrence_surv_60m))
+
+  fmla <- as.formula(paste0("Surv(time_recurrence_surv_60m, recurrence_60m) ~ ", exposure_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, threshold_type = threshold_label,
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, threshold_type = threshold_label,
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+run_cox_RFS_ihc_continuous <- function(marker_label, marker_var, data, maxit_val = 100000) {
+
+  df0 <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(recurrence_60m), !is.na(time_recurrence_surv_60m))
+
+  fmla <- as.formula(paste0("Surv(time_recurrence_surv_60m, recurrence_60m) ~ ", marker_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, threshold_type = "continuous",
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, threshold_type = "continuous",
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+univ_RFS_maxstat_ihc <- bind_rows(
+  lapply(compartments, function(m) run_cox_RFS_ihc_group(m, m, "Group_maxstat", "maxstat", ihc_data))
+)
+univ_RFS_median_ihc <- bind_rows(
+  lapply(compartments, function(m) run_cox_RFS_ihc_group(m, m, "Group_median", "median", ihc_data))
+)
+univ_RFS_continuous_ihc <- bind_rows(
+  lapply(compartments, function(m) run_cox_RFS_ihc_continuous(m, m, ihc_data))
+)
+
+univ_RFS_ihc_all <- bind_rows(univ_RFS_maxstat_ihc, univ_RFS_median_ihc, univ_RFS_continuous_ihc) %>%
+  group_by(threshold_type) %>%
+  mutate(p_adj_BH = p.adjust(pval, method = "BH")) %>%
+  ungroup()
+
+univ_RFS_ihc_formatted <- univ_RFS_ihc_all %>%
+  mutate(
+    HR_CI = sprintf("%.3f (%.3f\u2013%.3f)", HR, lower_095, upper_095),
+    pval = round(pval, 4), p_adj_BH = round(p_adj_BH, 4)
+  ) %>%
+  select(marker, threshold_type, HR_CI, pval, p_adj_BH, n, n_events, n_iter, converged) %>%
+  arrange(marker, threshold_type)
+
+cutoffs_RFS_cd123 <- make_cutoff_table_ihc(ihc_data, compartments,
+                                           "time_recurrence_surv_60m", "recurrence_60m")
+univ_RFS_ihc_formatted <- add_cutoffs_ihc(univ_RFS_ihc_formatted, cutoffs_RFS_cd123)
+kable(univ_RFS_ihc_formatted)
+```
+
+
+
+```{r}
+
+# ============================================================================
+# RFS -- SELECT MARKERS FOR MULTIVARIATE
+# ============================================================================
+
+selected_RFS_ihc <- univ_RFS_ihc_all %>%
+  filter(!is.na(p_adj_BH), p_adj_BH < 0.10) %>%
+  pull(marker) %>%
+  unique()
+
+cat("CD123 markers entering ALL RFS multivariable models:\n")
+print(selected_RFS_ihc)
+```
+
+
+
+```{r}
+# ============================================================================
+# RFS -- MULTIVARIATE MAXSTAT / MEDIAN
+# adjusted for FIGO + p53
+# ============================================================================
+
+perform_cox_RFS_ihc_multiv <- function(marker_label, marker_var, exposure_var,
+                                        data, covariates, maxit_val = 100000) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_recurrence_surv_60m", "recurrence_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+
+  df0 <- df0 %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(recurrence_60m), !is.na(time_recurrence_surv_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, variable = NA_character_, coef = NA_real_, HR = NA_real_,
+      lower_095 = NA_real_, upper_095 = NA_real_, pval = NA_real_,
+      n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients), HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower), upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","), converged = converged, stringsAsFactors = FALSE
+  )
+}
+
+
+multiv_RFS_maxstat_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(m) {
+    perform_cox_RFS_ihc_multiv(m, m, "Group_maxstat", ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_RFS_maxstat_ihc) > 0) {
+  multiv_RFS_maxstat_ihc <- multiv_RFS_maxstat_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- grepl("^Group_maxstat", multiv_RFS_maxstat_ihc$variable)
+  multiv_RFS_maxstat_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_RFS_maxstat_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+
+multiv_RFS_median_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(m) {
+    perform_cox_RFS_ihc_multiv(m, m, "Group_median", ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_RFS_median_ihc) > 0) {
+  multiv_RFS_median_ihc <- multiv_RFS_median_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- grepl("^Group_median", multiv_RFS_median_ihc$variable)
+  multiv_RFS_median_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_RFS_median_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+multiv_RFS_maxstat_ihc <- multiv_RFS_maxstat_ihc %>% mutate(threshold_type = "maxstat", .after = marker)
+multiv_RFS_median_ihc  <- multiv_RFS_median_ihc  %>% mutate(threshold_type = "median",  .after = marker)
+
+# ============================================================================
+# RFS -- MULTIVARIATE CONTINUOUS
+# ============================================================================
+
+perform_cox_RFS_ihc_multiv_continuous <- function(marker_label, marker_var,
+                                                    data, covariates, maxit_val = 100000) {
+
+  df0 <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(recurrence_60m), !is.na(time_recurrence_surv_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    paste(c(marker_var, covariates), collapse = " + ")
+  ))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df0, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      marker = marker_label, variable = NA_character_, coef = NA_real_, HR = NA_real_,
+      lower_095 = NA_real_, upper_095 = NA_real_, pval = NA_real_,
+      n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    marker = marker_label, variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients), HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower), upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0), n_events = sum(df0$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged, stringsAsFactors = FALSE
+  )
+}
+
+multiv_RFS_continuous_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(marker) {
+    perform_cox_RFS_ihc_multiv_continuous(marker, marker, ihc_data, covariates_full)
+  }))
+} else data.frame()
+
+if (nrow(multiv_RFS_continuous_ihc) > 0) {
+  multiv_RFS_continuous_ihc <- multiv_RFS_continuous_ihc %>% mutate(p_adj_BH = NA_real_)
+  marker_rows <- multiv_RFS_continuous_ihc$variable == multiv_RFS_continuous_ihc$marker
+  multiv_RFS_continuous_ihc$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_RFS_continuous_ihc$pval[marker_rows], method = "BH"
+  )
+}
+
+multiv_RFS_continuous_ihc <- multiv_RFS_continuous_ihc %>%
+  mutate(threshold_type = "continuous", .after = marker)
+
+multiv_RFS_ihc_all <- bind_rows(
+  multiv_RFS_maxstat_ihc,
+  multiv_RFS_median_ihc,
+  multiv_RFS_continuous_ihc
+)
+
+format_table_RFS_ihc <- function(df) {
+  df %>%
+    mutate(
+      variable_label = case_when(
+        grepl("^Group_", variable) ~ "Enrichment (High vs Low)",
+        variable == marker ~ "Continuous (per unit)",
+        variable == "figo_ini_ava0 (Initial)" ~ "FIGO (Initial)",
+        variable == "p53_ihc_statusWt" ~ "p53 (Normal)",
+        TRUE ~ variable
+      ),
+      HR_CI = sprintf("%.4f (%.4f\u2013%.4f)", HR, lower_095, upper_095),
+      coef = round(coef, 4), pval = round(pval, 4), p_adj_BH = round(p_adj_BH, 4)
+    ) %>%
+    select(marker, threshold_type, Variable = variable_label, Coef = coef,
+           `HR (95% CI)` = HR_CI, `p-value` = pval, `p (BH-adj)` = p_adj_BH,
+           n, n_events, n_iter, converged)
+}
+
+multiv_RFS_ihc_formatted <- format_table_RFS_ihc(multiv_RFS_ihc_all) %>%
+  arrange(marker, threshold_type)
+
+multiv_RFS_ihc_formatted <- add_cutoffs_ihc(multiv_RFS_ihc_formatted, cutoffs_RFS_cd123)
+
+kable(multiv_RFS_ihc_formatted, caption = "Multivariate Firth Cox regression for RFS: CD123 IHC")
+```
+
+
+```{r}
+# ============================================================================
+# RFS BOOTSTRAP OPTIMISM CORRECTION
+# ============================================================================
+
+sig_maxstat_RFS_ihc <- multiv_RFS_maxstat_ihc %>%
+  filter(grepl("^Group_maxstat", variable), p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+sig_median_RFS_ihc <- multiv_RFS_median_ihc %>%
+  filter(grepl("^Group_median", variable), p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+sig_continuous_RFS_ihc <- multiv_RFS_continuous_ihc %>%
+  filter(variable == marker, p_adj_BH < 0.05) %>%
+  pull(marker) %>% unique()
+
+cat("RFS maxstat models for bootstrap:\n"); print(sig_maxstat_RFS_ihc)
+cat("\nRFS median models for bootstrap:\n"); print(sig_median_RFS_ihc)
+cat("\nRFS continuous models for bootstrap:\n"); print(sig_continuous_RFS_ihc)
+```
+
+
+```{r}
+# ============================================================================
+# RFS BOOTSTRAP FUNCTIONS 
+# ============================================================================
+
+get_cutoff_RFS_ihc <- function(threshold_type, marker_var, data) {
+  if (threshold_type == "maxstat") {
+    find_maxstat_cutoff_ihc("time_recurrence_surv_60m", "recurrence_60m", marker_var, data)
+  } else {
+    median(data[[marker_var]], na.rm = TRUE)
+  }
+}
+
+bootstrap_cutoff_RFS_ihc <- function(marker_val,
+                                     threshold_type,
+                                     data,
+                                     covariates,
+                                     B = 1000,
+                                     maxit_boot = 500,
+                                     maxstep_boot = 0.5,
+                                     seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data[
+    !is.na(data[[marker_val]]) &
+      !is.na(data$time_recurrence_surv_60m) &
+      !is.na(data$recurrence_60m),
+  ]
+
+  cutoff0 <- get_cutoff_RFS_ihc(threshold_type, marker_val, df0)
+  if (is.na(cutoff0)) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "cutoff_not_found"))
+  }
+
+  df0$Group <- factor(ifelse(df0[[marker_val]] > cutoff0, "High", "Low"), levels = c("Low", "High"))
+  if (nlevels(droplevels(df0$Group)) < 2) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "single_group"))
+  }
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ Group + ", paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("GroupHigh" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["GroupHigh"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    cutoff_b <- get_cutoff_RFS_ihc(threshold_type, marker_val, dboot)
+    if (is.na(cutoff_b)) next
+
+    dboot$Group <- factor(ifelse(dboot[[marker_val]] > cutoff_b, "High", "Low"), levels = c("Low", "High"))
+    if (nlevels(droplevels(dboot$Group)) < 2) next
+    ev_tab_boot <- table(dboot$Group, dboot$recurrence_60m)
+    if (ncol(ev_tab_boot) < 2 || any(ev_tab_boot[, 2] == 0)) next
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("GroupHigh" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["GroupHigh"])
+
+    df_test <- df0
+    df_test$Group <- factor(ifelse(df_test[[marker_val]] > cutoff_b, "High", "Low"), levels = c("Low", "High"))
+    if (nlevels(droplevels(df_test$Group)) < 2) next
+    ev_tab_test <- table(df_test$Group, df_test$recurrence_60m)
+    if (ncol(ev_tab_test) < 2 || any(ev_tab_test[, 2] == 0)) next
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df_test, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("GroupHigh" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["GroupHigh"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(marker = marker_val, threshold_type = threshold_type,
+                       HR_apparent = exp(beta_apparent), HR_corrected = NA,
+                       HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+                       B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+                       elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    marker = marker_val, threshold_type = threshold_type,
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+boot_RFS_ihc_maxstat <- if (length(sig_maxstat_RFS_ihc) > 0) {
+  bind_rows(lapply(sig_maxstat_RFS_ihc, bootstrap_cutoff_RFS_ihc,
+                    threshold_type = "maxstat", data = ihc_data,
+                    covariates = covariates_full, B = 1000))
+} else data.frame()
+
+boot_RFS_ihc_median <- if (length(sig_median_RFS_ihc) > 0) {
+  bind_rows(lapply(sig_median_RFS_ihc, bootstrap_cutoff_RFS_ihc,
+                    threshold_type = "median", data = ihc_data,
+                    covariates = covariates_full, B = 1000))
+} else data.frame()
+```
+
+```{r}
+# ============================================================================
+# CONTINUOUS RFS BOOTSTRAP
+# ============================================================================
+
+bootstrap_continuous_RFS_ihc <- function(marker_val,
+                                         data,
+                                         covariates,
+                                         B = 1000,
+                                         maxit_boot = 500,
+                                         maxstep_boot = 0.5,
+                                         seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_val]]),
+      !is.na(time_recurrence_surv_60m),
+      !is.na(recurrence_60m),
+      if_all(all_of(covariates), ~ !is.na(.))
+    ) %>%
+    droplevels()
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ", marker_val, " + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !(marker_val %in% names(fit_apparent$coefficients))) {
+    return(data.frame(marker = marker_val, threshold_type = "continuous",
+                       HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+                       HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+                       pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients[marker_val])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !(marker_val %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients[marker_val])
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df0, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !(marker_val %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients[marker_val])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(marker = marker_val, threshold_type = "continuous",
+                       HR_apparent = exp(beta_apparent), HR_corrected = NA,
+                       HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+                       B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+                       elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    marker = marker_val, threshold_type = "continuous",
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+boot_RFS_ihc_continuous <- if (length(sig_continuous_RFS_ihc) > 0) {
+  bind_rows(lapply(sig_continuous_RFS_ihc, bootstrap_continuous_RFS_ihc,
+                    data = ihc_data, covariates = covariates_full, B = 1000))
+} else data.frame()
+
+boot_RFS_ihc_all <- bind_rows(boot_RFS_ihc_maxstat, boot_RFS_ihc_median, boot_RFS_ihc_continuous) %>%
+  arrange(marker, threshold_type)
+
+kable(boot_RFS_ihc_all, caption = "Bootstrap optimism correction for multivariable RFS models: CD123 IHC")
+```
+
+
+
+```{r}
+# ============================================================================
+# RFS -- PROPORTIONAL HAZARDS ASSUMPTION
+# ============================================================================
+
+check_ph_RFS_ihc <- function(marker_label, marker_var, data, exposure_var, covariates) {
+
+  df0 <- add_threshold_groups_ihc(data, "time_recurrence_surv_60m", "recurrence_60m", marker_var)
+  df0[[exposure_var]] <- relevel(factor(df0[[exposure_var]]), ref = "Low")
+
+  d <- df0 %>%
+    mutate(recurrence_60m = as.numeric(as.character(recurrence_60m))) %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(time_recurrence_surv_60m), !is.na(recurrence_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(data.frame(marker = marker_label, term = NA_character_, chisq = NA_real_, df = NA_real_,
+                       p = NA_real_, global_p = NA_real_, n = nrow(d),
+                       n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+                       note = "coxph_fit_failed", stringsAsFactors = FALSE))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(marker = marker_label, term = NA_character_, chisq = NA_real_, df = NA_real_,
+                       p = NA_real_, global_p = NA_real_, n = nrow(d),
+                       n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+                       note = "zph_failed", stringsAsFactors = FALSE))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(marker = marker_label, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+             p = round(tab$p, 4), global_p = round(global_p, 4), n = nrow(d),
+             n_events = sum(d$recurrence_60m == 1, na.rm = TRUE), note = NA_character_,
+             stringsAsFactors = FALSE)
+}
+
+
+check_ph_RFS_ihc_continuous <- function(marker_label, marker_var, data, covariates) {
+
+  d <- data %>%
+    filter(!is.na(.data[[marker_var]]), !is.na(time_recurrence_surv_60m), !is.na(recurrence_60m),
+           if_all(all_of(covariates), ~ !is.na(.))) %>%
+    mutate(recurrence_60m = as.numeric(as.character(recurrence_60m))) %>%
+    droplevels()
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    marker_var, " + ", paste(covariates, collapse = " + ")
+  ))
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(data.frame(marker = marker_label, term = NA_character_, chisq = NA_real_, df = NA_real_,
+                       p = NA_real_, global_p = NA_real_, n = nrow(d),
+                       n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+                       note = "coxph_fit_failed", stringsAsFactors = FALSE))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(marker = marker_label, term = NA_character_, chisq = NA_real_, df = NA_real_,
+                       p = NA_real_, global_p = NA_real_, n = nrow(d),
+                       n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+                       note = "zph_failed", stringsAsFactors = FALSE))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(marker = marker_label, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+             p = round(tab$p, 4), global_p = round(global_p, 4), n = nrow(d),
+             n_events = sum(d$recurrence_60m == 1, na.rm = TRUE), note = NA_character_,
+             stringsAsFactors = FALSE)
+}
+
+ph_RFS_maxstat_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(m) {
+    check_ph_RFS_ihc(marker_label = m, marker_var = m, data = ihc_data,
+                      exposure_var = "Group_maxstat", covariates = covariates_full)
+  })) %>% mutate(threshold_type = "maxstat", .after = marker)
+} else data.frame()
+
+ph_RFS_median_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(m) {
+    check_ph_RFS_ihc(marker_label = m, marker_var = m, data = ihc_data,
+                      exposure_var = "Group_median", covariates = covariates_full)
+  })) %>% mutate(threshold_type = "median", .after = marker)
+} else data.frame()
+
+
+ph_RFS_continuous_ihc <- if (length(selected_RFS_ihc) > 0) {
+  bind_rows(lapply(selected_RFS_ihc, function(m) {
+    check_ph_RFS_ihc_continuous(m, m, ihc_data, covariates_full)
+  })) %>% mutate(threshold_type = "continuous", .after = marker)
+} else data.frame()
+
+ph_RFS_ihc_all <- bind_rows(ph_RFS_maxstat_ihc, ph_RFS_median_ihc, ph_RFS_continuous_ihc) %>%
+  arrange(marker, threshold_type, term)
+
+kable(ph_RFS_ihc_all, caption = "Proportional hazards assumption for multivariable RFS models: CD123 IHC")
+```
+
+
+
+#Visualization
+
+```{r}
+forest_RFS_ihc_corrected <- make_optimism_forest_ihc(
+  boot_RFS_ihc_all, multiv_RFS_ihc_formatted,
+  "RFS \u2014 CD123 IHC, bootstrap-corrected HRs, maxstat vs. median"
+)
+forest_RFS_ihc_corrected
+
+forest_RFS_ihc_unadjusted <- make_forest_ihc(
+  multiv_df  = multiv_RFS_ihc_formatted,
+  multiv_raw = multiv_RFS_ihc_all,
+  title = "RFS \u2014 CD123 IHC, multivariable HRs, maxstat vs. median"
+)
+forest_RFS_ihc_unadjusted
+
+km_rfs_ihc_maxstat <- lapply(sig_maxstat_RFS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_recurrence_surv_60m", "recurrence_60m", "Group_maxstat",
+              paste0("RFS by ", m, " enrichment (maxstat)"))
+})
+
+km_rfs_ihc_median <- lapply(sig_median_RFS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_recurrence_surv_60m", "recurrence_60m", "Group_median",
+              paste0("RFS by ", m, " enrichment (median)"))
+})
+
+km_rfs_ihc_maxstat
+km_rfs_ihc_median
+```
+
+```{r}
+km_rfs_ihc_tumoral_median <- plot_km_ihc(
+  ihc_data, "Positive_cells_tumoral_area",
+  "time_recurrence_surv_60m", "recurrence_60m", "Group_median",
+  "RFS by Positive_cells_tumoral_area enrichment (median)"
+)
+
+km_rfs_ihc_tumoral_median
+```
+
+
+
+
+
+
+
+
+```{r}
+relabel <- function(df) df %>% mutate(marker = recode(marker,
+  "Positive_cells_tumoral_area"       = "Positive_cells_overall_tumoral_area",
+  "Positive_cells_tumor_stroma"       = "Positive_cells_tumor_associated_stroma",
+  "Positive_cells_perivascular_areas" = "Positive_cells_perivascular_areas"))
+
+tabs <- list(
+  CD123_uni_recurrence   = relabel(univ_RFS_ihc_formatted),
+  CD123_multi_recurrence = relabel(multiv_RFS_ihc_formatted),
+  CD123_uni_death        = relabel(univ_DSS_ihc_formatted),
+  CD123_multi_death      = relabel(multiv_DSS_ihc_formatted)
+)
+wb <- createWorkbook()
+for (nm in names(tabs)) {
+  addWorksheet(wb, nm)
+  writeData(wb, nm, tabs[[nm]], headerStyle = createStyle(textDecoration = "bold"))
+  setColWidths(wb, nm, cols = 1:ncol(tabs[[nm]]), widths = "auto")
+}
+saveWorkbook(wb, "CD123_survival_with_cutoffs.xlsx", overwrite = TRUE)
+```
+
+
+
+
+
+
+

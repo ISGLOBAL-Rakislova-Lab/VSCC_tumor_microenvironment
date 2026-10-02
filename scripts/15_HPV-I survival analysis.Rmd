@@ -1,0 +1,2177 @@
+
+#XCELL survival analysis
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+```
+
+
+```{r}
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+length(hpv_ind_xcell$cell_type)
+
+#We only obtain 39 cell types. This function automatically drops any cell type that has zero (or near-zero) signal across all samples, that's why we're seeing only 39 out of 64.
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c( "Sample"="id"))
+
+length(unique(analysis_data$cell_type))
+#We detect 39 and we keep 28
+
+```
+
+```{r}
+# --- Step 1: Filter out unwanted score cell types and selected immune subsets ---
+exclude_celltypes <- c(
+"B cell naive",  
+"T cell CD4+ (non-regulatory)",
+ "T cell CD4+ memory",                       
+ "Mast cell",                                                       
+ "NK cell",
+"T cell CD8+ naive",
+"Monocyte",
+"T cell gamma delta")
+
+analysis_data <- analysis_data %>%
+  filter(!cell_type %in% exclude_celltypes)
+
+
+length(unique(analysis_data$cell_type))
+#31
+```
+
+```{r}
+# --- Step 1: Filter out progenitor cell types
+exclude_celltypes <- c(
+"Common lymphoid progenitor",     
+"Common myeloid progenitor", 
+"Granulocyte-monocyte progenitor")
+
+analysis_data <- analysis_data %>%
+  filter(!cell_type %in% exclude_celltypes)
+
+length(unique(analysis_data$cell_type))
+#We detect 39 and we keep 28 (25 cell types and scores)
+```
+
+#Quality check
+```{r}
+p<-analysis_data %>%
+  ggplot(aes(x = Fraction)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  facet_wrap(~ cell_type, scales = "free_x") +
+  theme_minimal() +
+  labs(title = "Distribution of Cell Fractions Across Cell Types",
+       x = "Fraction",
+       y = "Count")
+p
+```
+
+
+#We see that monocyte and T cell CD4+ nonregulatory are so little that it is better not to use them for survival analysis.
+```{r}
+# Count how many samples per cell type
+analysis_data %>%
+  group_by(cell_type) %>%
+  summarise(n_samples = n_distinct(Sample)) %>%
+  arrange(n_samples)
+
+```
+
+
+```{r}
+analysis_data <- analysis_data %>%
+  mutate(
+    death_disease_60m = as.numeric(as.character(death_disease_60m)),
+    recurrence_60m    = as.numeric(as.character(recurrence_60m))
+  )
+```
+
+#######REVIEW
+
+#Functions to find the cutoffs and thresholds
+```{r}
+find_maxstat_cutoff <- function(time_var, event_var, fraction_var, data) {
+  n <- nrow(data)
+  if (n < 10) return(NA_real_)
+  fmla <- as.formula(paste0("survival::Surv(", time_var, ", ", event_var,
+                             ") ~ ", fraction_var))
+  MAXSTAT <- tryCatch(
+    maxstat::maxstat.test(fmla, data = data, smethod = "LogRank",
+                           pmethod = "Lau92", iscores = TRUE,
+                           minprop = 0.2, maxprop = 0.8),
+    error = function(e) NA
+  )
+  if (isTRUE(is.na(MAXSTAT))) return(NA_real_)
+  MAXSTAT$estimate
+}
+
+add_threshold_groups <- function(df, time_var, event_var, fraction_var = "Fraction") {
+  df %>%
+    group_by(cell_type) %>%
+    mutate(
+      cutoff_maxstat  = tryCatch(find_maxstat_cutoff(time_var, event_var, fraction_var,
+                                                       cur_data_all()),
+                                  error = function(e) NA_real_),
+      Group_maxstat   = ifelse(!is.na(cutoff_maxstat) & .data[[fraction_var]] > cutoff_maxstat,
+                                "High", "Low"),
+      cutoff_median   = median(.data[[fraction_var]], na.rm = TRUE),
+      Group_median    = ifelse(.data[[fraction_var]] > cutoff_median, "High", "Low")
+    ) %>%
+    ungroup()
+}
+
+# ============================================================================
+# Shared convergence check for coxphf models
+# Applied consistently across all univariate/multivariate DDS/RFS functions
+# ============================================================================
+check_convergence <- function(model, maxit_val) {
+  n_iter <- model$iter
+  !is.null(n_iter) &&
+    all(n_iter < maxit_val) &&
+    is.finite(sum(model$coefficients))
+}
+
+
+
+
+
+# One row per cell_type x threshold_type: cut-point, n and events per group
+make_cutoff_table <- function(data, event_var) {
+
+  counts_one <- function(group_col, label) {
+    data %>%
+      group_by(cell_type, Group = .data[[group_col]]) %>%
+      summarise(n = n(),
+                events = sum(.data[[event_var]] == 1, na.rm = TRUE),
+                .groups = "drop") %>%
+      mutate(threshold_type = label)
+  }
+
+  counts <- bind_rows(counts_one("Group_maxstat", "maxstat"),
+                      counts_one("Group_median",  "median")) %>%
+    pivot_wider(names_from = Group, values_from = c(n, events),
+                values_fill = 0)
+
+  cuts <- data %>%
+    distinct(cell_type, cutoff_maxstat, cutoff_median) %>%
+    pivot_longer(c(cutoff_maxstat, cutoff_median),
+                 names_to = "threshold_type", values_to = "cutoff") %>%
+    mutate(threshold_type = sub("cutoff_", "", threshold_type))
+
+  cuts %>%
+    left_join(counts, by = c("cell_type", "threshold_type")) %>%
+    transmute(cell_type, threshold_type,
+              cutoff = signif(cutoff, 4),
+              `n (Low/High)`      = paste0(n_Low, "/", n_High),
+              `Events (Low/High)` = paste0(events_Low, "/", events_High))
+}
+
+# Adds the cut-point columns to a formatted table.
+# In multivariable tables, values are shown only on the enrichment row.
+add_cutoffs <- function(tab, cutoff_table) {
+  tab <- tab %>%
+    left_join(cutoff_table, by = c("cell_type", "threshold_type")) %>%
+    relocate(cutoff, `n (Low/High)`, `Events (Low/High)`,
+             .after = threshold_type)
+
+  if ("Variable" %in% names(tab)) {
+    keep <- tab$Variable == "Enrichment (High vs Low)"
+    tab$cutoff[!keep]              <- NA
+    tab$`n (Low/High)`[!keep]      <- NA
+    tab$`Events (Low/High)`[!keep] <- NA
+  }
+  tab
+}
+
+```
+
+
+```{r}
+# ============================================================================
+# DISEASE-SPECIFIC DEATH (DDS) ANALYSIS
+# maxstat + median + continuous Fraction
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Reference levels
+# ----------------------------------------------------------------------------
+
+analysis_data$figo_ini_ava <- relevel(
+  factor(analysis_data$figo_ini_ava),
+  ref = "1 (Advanced)"
+)
+
+analysis_data$p53_ihc_status <- relevel(
+  factor(analysis_data$p53_ihc_status),
+  ref = "Mutant"
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Add DDS-specific thresholds
+# ----------------------------------------------------------------------------
+
+analysis_data <- add_threshold_groups(
+  analysis_data,
+  time_var = "time_death_surv_60m",
+  event_var = "death_disease_60m",
+  fraction_var = "Fraction"
+)
+
+
+analysis_data$Group_maxstat <- relevel(
+  factor(analysis_data$Group_maxstat),
+  ref = "Low"
+)
+
+analysis_data$Group_median <- relevel(
+  factor(analysis_data$Group_median),
+  ref = "Low"
+)
+
+
+
+cell_types_all <- unique(analysis_data$cell_type)
+
+
+cutoffs_DDS <- make_cutoff_table(analysis_data, event_var = "death_disease_60m")
+
+
+# Sanity check against Fig 2D risk tables:
+# pDC maxstat should be 15/37, median 26/26
+cutoffs_DDS %>% filter(cell_type == "Plasmacytoid dendritic cell")
+
+# ============================================================================
+# UNIVARIATE DDS
+# ============================================================================
+
+
+run_cox_DDS_group <- function(ct,
+                              exposure_var,
+                              threshold_label,
+                              maxit_val = 100000) {
+
+  df <- filter(analysis_data, cell_type == ct)
+  if (nrow(df) == 0) return(NULL)
+
+  fmla <- as.formula(paste0("Surv(time_death_surv_60m, death_disease_60m) ~ ", exposure_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = ct, threshold_type = threshold_label,
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df), n_events = sum(df$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)  # <-- fixed
+
+  data.frame(
+    cell_type = ct, threshold_type = threshold_label,
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df), n_events = sum(df$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged  # <-- fixed
+  )
+}
+
+
+
+# ----------------------------------------------------------------------------
+# Maxstat
+# ----------------------------------------------------------------------------
+
+univ_DDS_maxstat_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_DDS_group,
+    exposure_var="Group_maxstat",
+    threshold_label="maxstat"
+  )
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Median
+# ----------------------------------------------------------------------------
+
+univ_DDS_median_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_DDS_group,
+    exposure_var="Group_median",
+    threshold_label="median"
+  )
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Continuous Fraction
+# ----------------------------------------------------------------------------
+
+run_cox_DDS_continuous <- function(ct, maxit_val = 100000) {
+
+  df <- filter(analysis_data, cell_type == ct)
+  if (nrow(df) == 0) return(NULL)
+
+  model <- tryCatch(
+    coxphf(Surv(time_death_surv_60m, death_disease_60m) ~ Fraction,
+           data = df, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = ct, threshold_type = "continuous",
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df), n_events = sum(df$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)  # <-- fixed
+
+  data.frame(
+    cell_type = ct, threshold_type = "continuous",
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df), n_events = sum(df$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged  # <-- fixed
+  )
+}
+
+
+
+univ_DDS_continuous_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_DDS_continuous
+  )
+)
+
+
+
+
+# ----------------------------------------------------------------------------
+# Combine + BH correction
+# ----------------------------------------------------------------------------
+
+univ_DDS_all_sensitivity <- bind_rows(
+  univ_DDS_maxstat_all,
+  univ_DDS_median_all,
+  univ_DDS_continuous_all
+)
+
+
+
+univ_DDS_all_sensitivity <- univ_DDS_all_sensitivity %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH=p.adjust(
+      pval,
+      method="BH"
+    )
+  ) %>%
+  ungroup()
+
+
+
+# ----------------------------------------------------------------------------
+# Table
+# ----------------------------------------------------------------------------
+
+univ_DDS_all_sensitivity_formatted <-
+  univ_DDS_all_sensitivity %>%
+  mutate(
+    HR_CI=sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      lower_095,
+      upper_095
+    ),
+    pval=round(pval,4),
+    p_adj_BH=round(p_adj_BH,4)
+  ) %>%
+  select(
+    cell_type,
+    threshold_type,
+    HR_CI,
+    pval,
+    p_adj_BH,
+    n,
+    n_events,
+    n_iter,
+    converged
+  ) %>%
+  arrange(
+    cell_type,
+    threshold_type
+  )
+
+
+
+univ_DDS_all_sensitivity_formatted <- add_cutoffs(univ_DDS_all_sensitivity_formatted, cutoffs_DDS)
+
+kable(univ_DDS_all_sensitivity_formatted)
+```
+
+
+```{r}
+# ============================================================================
+# MULTIVARIATE DDS — selected populations
+# adjusted for FIGO + p53
+# Cell types selected as the UNION of any cell type with univariate
+# p_adj_BH < 0.1 under maxstat, median, OR continuous. That same set of
+# cell types is then run through all three multivariate models (maxstat,
+# median, continuous) -- not restricted per-threshold.
+# ============================================================================
+
+selected_cell_types_DDS <- univ_DDS_all_sensitivity %>%
+  filter(p_adj_BH < 0.1) %>%
+  pull(cell_type) %>%
+  unique()
+
+cat("Cell types entering ALL DDS multivariate models (maxstat, median, continuous):\n")
+print(selected_cell_types_DDS)
+
+perform_cox_analysis_DDS <- function(cell_type,
+                                     data,
+                                     exposure_var,
+                                     covariates,
+                                     maxit_val = 100000) {
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+  d <- data %>% filter(cell_type == !!cell_type)
+  model <- tryCatch(
+    coxphf(fmla, data = d, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = cell_type, variable = NA, coef = NA, HR = NA,
+      lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(d), n_events = sum(d$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+  converged <- check_convergence(model, maxit_val)
+  data.frame(
+    cell_type = cell_type,
+    variable = names(model$coefficients),
+    coef = model$coefficients, HR = exp(model$coefficients),
+    lower_095 = model$ci.lower, upper_095 = model$ci.upper, pval = model$prob,
+    n = nrow(d), n_events = sum(d$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+covariates_full <- c(
+  "figo_ini_ava",
+  "p53_ihc_status"
+)
+
+# ----------------------------------------------------------------------------
+# All three loops now use the SAME selected_cell_types_DDS union.
+# Guarded with length()>0 in case the union is ever empty.
+# ----------------------------------------------------------------------------
+
+multiv_DDS_maxstat_selected <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_DDS,
+      perform_cox_analysis_DDS,
+      data = analysis_data,
+      exposure_var = "Group_maxstat",
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "maxstat", .after = cell_type)
+} else {
+  data.frame()
+}
+
+multiv_DDS_median_selected <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_DDS,
+      perform_cox_analysis_DDS,
+      data = analysis_data,
+      exposure_var = "Group_median",
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "median", .after = cell_type)
+} else {
+  data.frame()
+}
+
+# ============================================================================
+# MULTIVARIATE DDS — CONTINUOUS FRACTION
+# adjusted for FIGO + p53. Same selected_cell_types_DDS union as above.
+# ============================================================================
+
+perform_cox_analysis_DDS_continuous <- function(cell_type,
+                                                 data,
+                                                 covariates,
+                                                 maxit_val = 100000) {
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ Fraction + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  d <- data %>% filter(cell_type == !!cell_type)
+
+  model <- tryCatch(
+    coxphf(fmla, data = d, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = cell_type, variable = NA, coef = NA, HR = NA,
+      lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(d), n_events = sum(d$death_disease_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    cell_type = cell_type,
+    variable = names(model$coefficients),
+    coef = model$coefficients, HR = exp(model$coefficients),
+    lower_095 = model$ci.lower, upper_095 = model$ci.upper, pval = model$prob,
+    n = nrow(d), n_events = sum(d$death_disease_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+multiv_DDS_continuous_selected <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_DDS,
+      perform_cox_analysis_DDS_continuous,
+      data = analysis_data,
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "continuous", .after = cell_type)
+} else {
+  data.frame()
+}
+
+if (nrow(multiv_DDS_continuous_selected) > 0) {
+  multiv_DDS_continuous_selected <- multiv_DDS_continuous_selected %>%
+    mutate(p_adj_BH = NA_real_)
+  marker_rows <- multiv_DDS_continuous_selected$variable == "Fraction"
+  multiv_DDS_continuous_selected$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_DDS_continuous_selected$pval[marker_rows], method = "BH"
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Combine maxstat + median + continuous
+# ----------------------------------------------------------------------------
+
+multiv_DDS_selected <- bind_rows(
+  multiv_DDS_maxstat_selected,
+  multiv_DDS_median_selected,
+  multiv_DDS_continuous_selected
+)
+
+multiv_DDS_selected <- multiv_DDS_selected %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = ifelse(
+      grepl("^Group_", variable) | variable == "Fraction",
+      p.adjust(
+        pval[grepl("^Group_", variable) | variable == "Fraction"],
+        method = "BH"
+      )[match(
+        pval,
+        pval[grepl("^Group_", variable) | variable == "Fraction"]
+      )],
+      NA
+    )
+  ) %>%
+  ungroup()
+
+format_table_DDS <- function(df) {
+  df %>%
+    mutate(
+      variable_label = case_when(
+        grepl("^Group_", variable) ~ "Enrichment (High vs Low)",
+        variable == "Fraction" ~ "Continuous (per unit)",
+        variable == "figo_ini_ava0 (Initial)" ~ "FIGO (Initial)",
+        variable == "p53_ihc_statusWt" ~ "p53 (Normal)",
+        TRUE ~ variable
+      ),
+      HR_CI = sprintf("%.4f (%.4f\u2013%.4f)", HR, lower_095, upper_095),
+      coef = round(coef, 4),
+      pval = round(pval, 4),
+      p_adj_BH = round(p_adj_BH, 4)
+    ) %>%
+    select(
+      cell_type, threshold_type, Variable = variable_label, Coef = coef,
+      `HR (95% CI)` = HR_CI, `p-value` = pval, `p (BH-adj)` = p_adj_BH,
+      n, n_events, n_iter, converged
+    )
+}
+
+multiv_DDS_selected_formatted <-
+  format_table_DDS(multiv_DDS_selected) %>%
+  arrange(cell_type, threshold_type)
+
+multiv_DDS_selected_formatted <- add_cutoffs(multiv_DDS_selected_formatted, cutoffs_DDS)
+kable(multiv_DDS_selected_formatted)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# ============================================================================
+# PROPORTIONAL HAZARDS ASSUMPTION -- DSS (xCell)
+# Diagnostic only: coxphf (Firth) has no residuals/zph method, so this fits a
+# parallel unpenalized coxph() with the identical formula purely to obtain
+# Schoenfeld residual diagnostics. Effect sizes / inference for the paper
+# still come from the coxphf models above.
+# Now also runs the continuous ("Fraction") model, since selected_cell_types_DDS
+# is the union set tested under all three thresholds.
+# ============================================================================
+
+check_ph_DDS <- function(cell_type, data, exposure_var, covariates) {
+
+  fmla <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  d <- data %>%
+    filter(cell_type == !!cell_type) %>%
+    mutate(
+      death_disease_60m = as.numeric(as.character(death_disease_60m))
+    ) %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(figo_ini_ava), !is.na(p53_ihc_status)) %>%
+    droplevels()
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) {
+    message("coxph failed for ", cell_type, " / ", exposure_var, ": ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(fit)) {
+    return(data.frame(cell_type = cell_type, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "coxph_fit_failed"))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(cell_type = cell_type, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "zph_failed"))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(
+    cell_type = cell_type, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+    p = round(tab$p, 4), global_p = round(global_p, 4), note = NA_character_
+  )
+}
+
+ph_DDS_maxstat <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_DDS, check_ph_DDS,
+           data = analysis_data, exposure_var = "Group_maxstat", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "maxstat", .after = cell_type)
+} else {
+  data.frame()
+}
+
+ph_DDS_median <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_DDS, check_ph_DDS,
+           data = analysis_data, exposure_var = "Group_median", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "median", .after = cell_type)
+} else {
+  data.frame()
+}
+
+# NEW: continuous PH check -- exposure_var = "Fraction" (the raw column,
+# not a Group_* factor). check_ph_DDS() is generic enough to accept this
+# directly since it just builds the formula from exposure_var + covariates.
+ph_DDS_continuous <- if (length(selected_cell_types_DDS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_DDS, check_ph_DDS,
+           data = analysis_data, exposure_var = "Fraction", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "continuous", .after = cell_type)
+} else {
+  data.frame()
+}
+
+ph_DDS_all <- bind_rows(ph_DDS_maxstat, ph_DDS_median, ph_DDS_continuous) %>%
+  arrange(cell_type, threshold_type, term)
+
+kable(ph_DDS_all)
+```
+
+
+
+
+
+
+
+```{r}
+
+get_cutoff_DDS <- function(threshold_type, data) {
+  if (threshold_type == "maxstat") {
+    find_maxstat_cutoff("time_death_surv_60m", "death_disease_60m", "Fraction", data)
+  } else {
+    median(data$Fraction, na.rm = TRUE)
+  }
+}
+
+bootstrap_cutoff_DDS <- function(cell_type_val,
+                                 threshold_type,
+                                 data,
+                                 covariates,
+                                 B = 200,
+                                 maxit_boot = 500,
+                                 maxstep_boot = 0.5,
+                                 seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(cell_type == cell_type_val)
+
+  df0 <- df0[
+    !is.na(df0$Fraction) &
+    !is.na(df0$time_death_surv_60m) &
+    !is.na(df0$death_disease_60m),
+  ]
+
+  cutoff0 <- get_cutoff_DDS(threshold_type, df0)
+
+  if (is.na(cutoff0)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "cutoff_not_found"
+    ))
+  }
+
+  df0$Group <- factor(
+    ifelse(df0$Fraction > cutoff0, "High", "Low"),
+    levels = c("Low", "High")
+  )
+
+  if (nlevels(droplevels(df0$Group)) < 2) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "single_group"
+    ))
+  }
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ Group + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("GroupHigh" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"
+    ))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["GroupHigh"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    cutoff_b <- get_cutoff_DDS(threshold_type, dboot)
+    if (is.na(cutoff_b)) next
+
+    dboot$Group <- factor(ifelse(dboot$Fraction > cutoff_b, "High", "Low"),
+                           levels = c("Low", "High"))
+    if (nlevels(droplevels(dboot$Group)) < 2) next
+    ev_tab_boot <- table(dboot$Group, dboot$death_disease_60m)
+    if (ncol(ev_tab_boot) < 2 || any(ev_tab_boot[, 2] == 0)) next
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("GroupHigh" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["GroupHigh"])
+
+    df_test <- df0
+    df_test$Group <- factor(ifelse(df_test$Fraction > cutoff_b, "High", "Low"),
+                             levels = c("Low", "High"))
+    if (nlevels(droplevels(df_test$Group)) < 2) next
+    ev_tab_test <- table(df_test$Group, df_test$death_disease_60m)
+    if (ncol(ev_tab_test) < 2 || any(ev_tab_test[, 2] == 0)) next
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df_test, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("GroupHigh" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["GroupHigh"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = exp(beta_apparent), HR_corrected = NA,
+      HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+      B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+      elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"
+    ))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    cell_type = cell_type_val, threshold_type = threshold_type,
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+# ============================================================================
+# CONTINUOUS bootstrap -- NEW, since multiv_DDS_selected now includes a
+# "continuous" threshold_type stratum that also needs a corrected estimate.
+# No cutoff to re-derive here; optimism is computed directly on the Fraction
+# coefficient.
+# ============================================================================
+
+bootstrap_continuous_DDS <- function(cell_type_val,
+                                     data,
+                                     covariates,
+                                     B = 1000,
+                                     maxit_boot = 500,
+                                     maxstep_boot = 0.5,
+                                     seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(cell_type == cell_type_val,
+           !is.na(Fraction), !is.na(time_death_surv_60m), !is.na(death_disease_60m))
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_death_surv_60m, death_disease_60m) ~ Fraction + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("Fraction" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = "continuous",
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"
+    ))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["Fraction"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("Fraction" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["Fraction"])
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df0, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("Fraction" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["Fraction"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = "continuous",
+      HR_apparent = exp(beta_apparent), HR_corrected = NA,
+      HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+      B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+      elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"
+    ))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    cell_type = cell_type_val, threshold_type = "continuous",
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+# ============================================================================
+# SELECT which (cell_type, threshold_type) combinations go into bootstrap:
+# apparent multivariate p_adj_BH < 0.05, checked SEPARATELY per threshold
+# (maxstat / median / continuous) -- NOT the full selected_cell_types_DDS
+# union used for the multivariate stage itself.
+# ============================================================================
+
+sig_maxstat_DDS <- multiv_DDS_selected %>%
+  filter(threshold_type == "maxstat", grepl("^Group_", variable), p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+sig_median_DDS <- multiv_DDS_selected %>%
+  filter(threshold_type == "median", grepl("^Group_", variable), p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+sig_continuous_DDS <- multiv_DDS_selected %>%
+  filter(threshold_type == "continuous", variable == "Fraction", p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+cat("Bootstrapping MAXSTAT DDS models for:\n"); print(sig_maxstat_DDS)
+cat("\nBootstrapping MEDIAN DDS models for:\n"); print(sig_median_DDS)
+cat("\nBootstrapping CONTINUOUS DDS models for:\n"); print(sig_continuous_DDS)
+```
+
+
+```{r}
+# ----------------------------------------------------------------------------
+# Timing test (unchanged in structure, just points at the correctly-filtered
+# significance-based list rather than the full union)
+# ----------------------------------------------------------------------------
+
+t_test <- bootstrap_cutoff_DDS(
+  cell_type_val = sig_maxstat_DDS[1],
+  threshold_type = "maxstat",
+  data = analysis_data,
+  covariates = covariates_full,
+  B = 20
+)
+
+print(t_test)
+
+per_iter_sec <- t_test$elapsed_sec / 20
+n_models_DDS <- length(sig_maxstat_DDS) + length(sig_median_DDS) + length(sig_continuous_DDS)
+B_full_planned <- 1000
+est_total_min <- (per_iter_sec * B_full_planned * n_models_DDS) / 60
+
+cat(sprintf("Per-iteration time: ~%.3f sec\nEstimated full DDS run (B=%d, %d models): ~%.1f min\n",
+            per_iter_sec, B_full_planned, n_models_DDS, est_total_min))
+```
+
+
+```{r}
+# ----------------------------------------------------------------------------
+# Full bootstrap runs, guarded for empty selections
+# ----------------------------------------------------------------------------
+
+B_DDS <- 1000
+
+boot_DDS_maxstat <- if (length(sig_maxstat_DDS) > 0) {
+  bind_rows(lapply(sig_maxstat_DDS, bootstrap_cutoff_DDS,
+                    threshold_type = "maxstat", data = analysis_data,
+                    covariates = covariates_full, B = B_DDS))
+} else data.frame()
+
+boot_DDS_median <- if (length(sig_median_DDS) > 0) {
+  bind_rows(lapply(sig_median_DDS, bootstrap_cutoff_DDS,
+                    threshold_type = "median", data = analysis_data,
+                    covariates = covariates_full, B = B_DDS))
+} else data.frame()
+
+boot_DDS_continuous <- if (length(sig_continuous_DDS) > 0) {
+  bind_rows(lapply(sig_continuous_DDS, bootstrap_continuous_DDS,
+                    data = analysis_data, covariates = covariates_full, B = B_DDS))
+} else data.frame()
+
+boot_DDS_all <- bind_rows(boot_DDS_maxstat, boot_DDS_median, boot_DDS_continuous) %>%
+  arrange(cell_type, threshold_type)
+
+kable(boot_DDS_all)
+```
+
+
+
+
+
+
+
+#Visualization
+```{r}
+# ============================================================================
+# Shared helper: builds a sensible plotting order from whatever cell types
+# are actually present in the data, instead of a hardcoded vector that can
+# silently drop cell types the union-based p_adj<0.1/p_adj<0.05 selection
+# newly includes. Aggregate scores (anything with "score" in the name) are
+# grouped first, then remaining cell types alphabetically. rev() at the end
+# keeps the same top-to-bottom convention as before after coord_flip().
+# ============================================================================
+
+build_cell_type_order <- function(cell_types) {
+  cell_types <- unique(cell_types)
+  is_score <- grepl("score", cell_types, ignore.case = TRUE)
+  ordered <- c(sort(cell_types[is_score]), sort(cell_types[!is_score]))
+  rev(ordered)
+}
+```
+
+#Corrected HR
+```{r}
+# ============================================================================
+# FOREST PLOT -- DSS, maxstat vs. median, bootstrap-corrected HRs
+# cell_type_order is now derived from boot_df itself, so every cell type
+# that made it into the bootstrap (p_adj<0.05 in the apparent multivariate
+# model) is guaranteed to appear -- nothing silently dropped.
+# ============================================================================
+
+library(ggplot2)
+
+make_optimism_forest_combined <- function(boot_df, multiv_df, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(cell_type, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- boot_df %>%
+    filter(!is.na(HR_corrected), threshold_type %in% c("maxstat", "median")) %>%
+    left_join(sig_df, by = c("cell_type", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    )
+
+  cell_type_order <- build_cell_type_order(df$cell_type)
+  df <- df %>% mutate(cell_type = factor(cell_type, levels = cell_type_order))
+
+  ggplot(df, aes(x = cell_type, y = HR_corrected, color = threshold_type,
+                  shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = HR_corrected_lower, ymax = HR_corrected_upper),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"),
+                        name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."),
+                        name = "Significance\n(apparent model)") +
+    labs(title = title, x = "", y = "Bootstrap-corrected Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DSS <- make_optimism_forest_combined(boot_DDS_all, multiv_DDS_selected_formatted,
+                                             "DSS \u2014 bootstrap-corrected HRs, maxstat vs. median")
+forest_DSS
+```
+
+
+
+
+
+#uncorrected HR
+```{r}
+
+library(ggplot2)
+
+make_forest_combined <- function(multiv_df, multiv_raw, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(cell_type, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- multiv_raw %>%
+    filter(variable %in% c("Group_maxstatHigh", "Group_medianHigh")) %>%
+    left_join(sig_df, by = c("cell_type", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    ) %>%
+    filter(!is.na(HR), !is.na(lower_095), !is.na(upper_095))
+
+  cell_type_order <- build_cell_type_order(df$cell_type)
+  df <- df %>% mutate(cell_type = factor(cell_type, levels = cell_type_order))
+
+  ggplot(df, aes(x = cell_type, y = HR, color = threshold_type, shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = lower_095, ymax = upper_095),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"), name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."), name = "Significance") +
+    labs(title = title, x = "", y = "Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DDS_unadjusted <- make_forest_combined(
+  multiv_df = multiv_DDS_selected_formatted,
+  multiv_raw = multiv_DDS_selected,
+  title = "DSS — multivariable HRs, maxstat vs. median"
+)
+
+forest_DDS_unadjusted
+```
+
+
+
+
+```{r}
+library(survminer)
+library(survival)
+
+plot_km <- function(data, cell_type_val, time_var, event_var, group_var, title) {
+
+  df <- data %>%
+    filter(cell_type == cell_type_val) %>%
+    mutate(!!event_var := as.numeric(as.character(.data[[event_var]]))) %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+
+  df[[group_var]] <- droplevels(factor(df[[group_var]], levels = c("Low", "High")))
+
+  grp_counts <- table(df[[group_var]])
+  if (any(grp_counts == 0) || length(grp_counts) < 2) {
+    stop(sprintf(
+      "Cannot build KM plot for '%s' / %s: group counts are %s.",
+      cell_type_val, group_var, paste(names(grp_counts), grp_counts, sep = "=", collapse = ", ")
+    ))
+  }
+
+  fmla <- as.formula(paste0("Surv(", time_var, ", ", event_var, ") ~ ", group_var))
+  fit <- survminer::surv_fit(fmla, data = df)   # <-- changed from survival::survfit()
+
+  ggsurvplot(
+    fit, data = df, pval = TRUE, risk.table = TRUE,
+    legend.title = "pDC enrichment", legend.labs = c("Low", "High"),
+    title = title, palette = c("gray50", "black"),
+    xlab = "Time (months)", ylab = "Survival probability"
+  )
+}
+
+km_dss_maxstat <- plot_km(
+  analysis_data, "Plasmacytoid dendritic cell",
+  "time_death_surv_60m", "death_disease_60m", "Group_maxstat",
+  "DSS by pDC enrichment (maxstat)"
+)
+
+km_dss_median <- plot_km(
+  analysis_data, "Plasmacytoid dendritic cell",
+  "time_death_surv_60m", "death_disease_60m", "Group_median",
+  "DSS by pDC enrichment (median)"
+)
+
+km_dss_maxstat
+km_dss_median
+```
+
+
+
+
+
+
+
+
+
+
+
+
+#RECURRENCE:
+
+```{r}
+
+# ============================================================================
+# RECURRENCE (RFS) ANALYSIS
+# maxstat + median + continuous Fraction
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Add recurrence-specific thresholds
+# ----------------------------------------------------------------------------
+
+analysis_data <- add_threshold_groups(
+  analysis_data,
+  time_var = "time_recurrence_surv_60m",
+  event_var = "recurrence_60m",
+  fraction_var = "Fraction"
+)
+
+
+# Set reference groups
+analysis_data$Group_maxstat <- relevel(
+  factor(analysis_data$Group_maxstat),
+  ref = "Low"
+)
+
+analysis_data$Group_median <- relevel(
+  factor(analysis_data$Group_median),
+  ref = "Low"
+)
+
+cutoffs_RFS <- make_cutoff_table(analysis_data, event_var = "recurrence_60m")
+
+# Check: pDC maxstat should be 33/19
+cutoffs_RFS %>% filter(cell_type == "Plasmacytoid dendritic cell")
+
+# ============================================================================
+# UNIVARIATE RFS
+# ============================================================================
+
+
+run_cox_RFS_group <- function(ct,
+                              exposure_var,
+                              threshold_label,
+                              maxit_val = 100000) {
+
+  df <- filter(analysis_data, cell_type == ct)
+  if (nrow(df) == 0) return(NULL)
+
+  fmla <- as.formula(paste0("Surv(time_recurrence_surv_60m, recurrence_60m) ~ ", exposure_var))
+
+  model <- tryCatch(
+    coxphf(fmla, data = df, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = ct, threshold_type = threshold_label,
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df), n_events = sum(df$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)  # <-- fixed
+
+  data.frame(
+    cell_type = ct, threshold_type = threshold_label,
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df), n_events = sum(df$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged  # <-- fixed
+  )
+}
+
+
+
+
+# ----------------------------------------------------------------------------
+# Maxstat
+# ----------------------------------------------------------------------------
+
+univ_RFS_maxstat_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_RFS_group,
+    exposure_var = "Group_maxstat",
+    threshold_label = "maxstat"
+  )
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Median
+# ----------------------------------------------------------------------------
+
+univ_RFS_median_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_RFS_group,
+    exposure_var = "Group_median",
+    threshold_label = "median"
+  )
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Continuous Fraction
+# ----------------------------------------------------------------------------
+
+run_cox_RFS_continuous <- function(ct, maxit_val = 100000) {
+
+  df <- filter(analysis_data, cell_type == ct)
+  if (nrow(df) == 0) return(NULL)
+
+  model <- tryCatch(
+    coxphf(Surv(time_recurrence_surv_60m, recurrence_60m) ~ Fraction,
+           data = df, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = ct, threshold_type = "continuous",
+      coef = NA, HR = NA, lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(df), n_events = sum(df$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  s <- summary(model)
+  converged <- check_convergence(model, maxit_val)  # <-- fixed
+
+  data.frame(
+    cell_type = ct, threshold_type = "continuous",
+    coef = s$coefficients, HR = exp(s$coefficients),
+    lower_095 = s$ci.lower, upper_095 = s$ci.upper, pval = s$prob,
+    n = nrow(df), n_events = sum(df$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged  # <-- fixed
+  )
+}
+
+
+
+
+univ_RFS_continuous_all <- bind_rows(
+  lapply(
+    cell_types_all,
+    run_cox_RFS_continuous
+  )
+)
+
+
+
+# ----------------------------------------------------------------------------
+# Combine all sensitivity analyses
+# ----------------------------------------------------------------------------
+
+univ_RFS_all_sensitivity <- bind_rows(
+  univ_RFS_maxstat_all,
+  univ_RFS_median_all,
+  univ_RFS_continuous_all
+)
+
+
+
+# ----------------------------------------------------------------------------
+# BH correction within analysis type
+# ----------------------------------------------------------------------------
+
+univ_RFS_all_sensitivity <- univ_RFS_all_sensitivity %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = p.adjust(
+      pval,
+      method = "BH"
+    )
+  ) %>%
+  ungroup()
+
+
+
+# ----------------------------------------------------------------------------
+# Table
+# ----------------------------------------------------------------------------
+
+univ_RFS_all_sensitivity_formatted <-
+  univ_RFS_all_sensitivity %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      lower_095,
+      upper_095
+    ),
+    pval = round(pval,4),
+    p_adj_BH = round(p_adj_BH,4)
+  ) %>%
+  select(
+    cell_type,
+    threshold_type,
+    HR_CI,
+    pval,
+    p_adj_BH,
+    n,
+    n_events,
+    n_iter,
+    converged
+  ) %>%
+  arrange(cell_type, threshold_type)
+
+
+univ_RFS_all_sensitivity_formatted <- add_cutoffs(univ_RFS_all_sensitivity_formatted, cutoffs_RFS)
+univ_RFS_all_sensitivity_formatted$converged <- ifelse(univ_RFS_all_sensitivity_formatted$converged, "Yes", "No")
+kable(univ_RFS_all_sensitivity_formatted)
+```
+
+
+
+
+
+
+```{r}
+# ============================================================================
+# MULTIVARIATE RFS — selected populations
+# adjusted for FIGO + p53
+# Cell types selected as the UNION of any cell type with univariate
+# p_adj_BH < 0.1 under maxstat, median, OR continuous. That same set of
+# cell types is then run through all three multivariate models (maxstat,
+# median, continuous) -- not restricted per-threshold.
+# ============================================================================
+
+selected_cell_types_RFS <- univ_RFS_all_sensitivity %>%
+  filter(p_adj_BH < 0.1) %>%
+  pull(cell_type) %>%
+  unique()
+
+cat("Cell types entering ALL RFS multivariate models (maxstat, median, continuous):\n")
+print(selected_cell_types_RFS)
+
+perform_cox_analysis_RFS <- function(cell_type,
+                                     data,
+                                     exposure_var,
+                                     covariates,
+                                     maxit_val = 100000) {
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  d <- data %>% filter(cell_type == !!cell_type)
+
+  model <- tryCatch(
+    coxphf(fmla, data = d, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = cell_type, variable = NA, coef = NA, HR = NA,
+      lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(d), n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  n_iter <- model$iter
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    cell_type = cell_type,
+    variable = names(model$coefficients),
+    coef = model$coefficients, HR = exp(model$coefficients),
+    lower_095 = model$ci.lower, upper_095 = model$ci.upper, pval = model$prob,
+    n = nrow(d), n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(n_iter, collapse = ","),
+    converged = converged
+  )
+}
+
+covariates_full <- c(
+  "figo_ini_ava",
+  "p53_ihc_status"
+)
+
+# ----------------------------------------------------------------------------
+# All three loops use the SAME selected_cell_types_RFS union.
+# Guarded with length()>0 in case the union is ever empty.
+# ----------------------------------------------------------------------------
+
+multiv_RFS_maxstat_selected <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_RFS,
+      perform_cox_analysis_RFS,
+      data = analysis_data,
+      exposure_var = "Group_maxstat",
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "maxstat", .after = cell_type)
+} else {
+  data.frame()
+}
+
+multiv_RFS_median_selected <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_RFS,
+      perform_cox_analysis_RFS,
+      data = analysis_data,
+      exposure_var = "Group_median",
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "median", .after = cell_type)
+} else {
+  data.frame()
+}
+
+# ============================================================================
+# MULTIVARIATE RFS — CONTINUOUS FRACTION
+# adjusted for FIGO + p53. Same selected_cell_types_RFS union as above.
+# ============================================================================
+
+perform_cox_analysis_RFS_continuous <- function(cell_type,
+                                                 data,
+                                                 covariates,
+                                                 maxit_val = 100000) {
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ Fraction + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  d <- data %>% filter(cell_type == !!cell_type)
+
+  model <- tryCatch(
+    coxphf(fmla, data = d, maxstep = 0.0001, maxit = maxit_val),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(data.frame(
+      cell_type = cell_type, variable = NA, coef = NA, HR = NA,
+      lower_095 = NA, upper_095 = NA, pval = NA,
+      n = nrow(d), n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+      n_iter = NA, converged = FALSE
+    ))
+  }
+
+  converged <- check_convergence(model, maxit_val)
+
+  data.frame(
+    cell_type = cell_type,
+    variable = names(model$coefficients),
+    coef = model$coefficients, HR = exp(model$coefficients),
+    lower_095 = model$ci.lower, upper_095 = model$ci.upper, pval = model$prob,
+    n = nrow(d), n_events = sum(d$recurrence_60m == 1, na.rm = TRUE),
+    n_iter = paste(model$iter, collapse = ","),
+    converged = converged
+  )
+}
+
+multiv_RFS_continuous_selected <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(
+      selected_cell_types_RFS,
+      perform_cox_analysis_RFS_continuous,
+      data = analysis_data,
+      covariates = covariates_full
+    )
+  ) %>%
+    mutate(threshold_type = "continuous", .after = cell_type)
+} else {
+  data.frame()
+}
+
+if (nrow(multiv_RFS_continuous_selected) > 0) {
+  multiv_RFS_continuous_selected <- multiv_RFS_continuous_selected %>%
+    mutate(p_adj_BH = NA_real_)
+  marker_rows <- multiv_RFS_continuous_selected$variable == "Fraction"
+  multiv_RFS_continuous_selected$p_adj_BH[marker_rows] <- p.adjust(
+    multiv_RFS_continuous_selected$pval[marker_rows], method = "BH"
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Combine maxstat + median + continuous
+# ----------------------------------------------------------------------------
+
+multiv_RFS_selected <- bind_rows(
+  multiv_RFS_maxstat_selected,
+  multiv_RFS_median_selected,
+  multiv_RFS_continuous_selected
+)
+
+multiv_RFS_selected <- multiv_RFS_selected %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = ifelse(
+      grepl("^Group_", variable) | variable == "Fraction",
+      p.adjust(
+        pval[grepl("^Group_", variable) | variable == "Fraction"],
+        method = "BH"
+      )[match(
+        pval,
+        pval[grepl("^Group_", variable) | variable == "Fraction"]
+      )],
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+format_table_RFS <- function(df) {
+  df %>%
+    mutate(
+      variable_label = case_when(
+        grepl("^Group_", variable) ~ "Enrichment (High vs Low)",
+        variable == "Fraction" ~ "Continuous (per unit)",
+        variable == "figo_ini_ava0 (Initial)" ~ "FIGO (Initial)",
+        variable == "p53_ihc_statusWt" ~ "p53 (Normal)",
+        TRUE ~ variable
+      ),
+      HR_CI = sprintf("%.4f (%.4f\u2013%.4f)", HR, lower_095, upper_095),
+      coef = round(coef, 4),
+      pval = round(pval, 4),
+      p_adj_BH = round(p_adj_BH, 4)
+    ) %>%
+    select(
+      cell_type, threshold_type, Variable = variable_label, Coef = coef,
+      `HR (95% CI)` = HR_CI, `p-value` = pval, `p (BH-adj)` = p_adj_BH,
+      n, n_events, n_iter, converged
+    )
+}
+
+multiv_RFS_selected_formatted <-
+  format_table_RFS(multiv_RFS_selected) %>%
+  arrange(cell_type, threshold_type)
+
+multiv_RFS_selected_formatted <- add_cutoffs(multiv_RFS_selected_formatted, cutoffs_RFS)
+multiv_RFS_selected_formatted$converged <- ifelse(multiv_RFS_selected_formatted$converged, "Yes", "No")
+```
+
+
+#save all 4 survival tables
+```{r}
+library(openxlsx)
+tabs <- list(
+  Uni_death_xcell        = univ_DDS_all_sensitivity_formatted,
+  Multi_death_xcell      = multiv_DDS_selected_formatted,
+  Uni_recurrence_xcell   = univ_RFS_all_sensitivity_formatted,
+  Multi_recurrence_xcell = multiv_RFS_selected_formatted
+)
+wb <- createWorkbook()
+for (nm in names(tabs)) {
+  addWorksheet(wb, nm)
+  writeData(wb, nm, tabs[[nm]], headerStyle = createStyle(textDecoration = "bold"))
+  setColWidths(wb, nm, cols = 1:ncol(tabs[[nm]]), widths = "auto")
+}
+saveWorkbook(wb, "Supplementary_Data_1_Survival_xCell.xlsx", overwrite = TRUE)
+```
+
+
+```{r}
+# ============================================================================
+# PROPORTIONAL HAZARDS ASSUMPTION -- RFS (xCell)
+# Diagnostic only: coxphf (Firth) has no residuals/zph method, so this fits a
+# parallel unpenalized coxph() with the identical formula purely to obtain
+# Schoenfeld residual diagnostics. Effect sizes / inference for the paper
+# still come from the coxphf models above.
+# Uses selected_cell_types_RFS (the union set) and now also runs the
+# continuous ("Fraction") model, matching the DSS fix.
+# ============================================================================
+
+check_ph_RFS <- function(cell_type, data, exposure_var, covariates) {
+
+  fmla <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+    paste(c(exposure_var, covariates), collapse = " + ")
+  ))
+
+  d <- data %>%
+    filter(cell_type == !!cell_type) %>%
+    mutate(
+      recurrence_60m = as.numeric(as.character(recurrence_60m))
+    ) %>%
+    filter(!is.na(.data[[exposure_var]]), !is.na(figo_ini_ava), !is.na(p53_ihc_status)) %>%
+    droplevels()
+
+  fit <- tryCatch(coxph(fmla, data = d), error = function(e) {
+    message("coxph failed for ", cell_type, " / ", exposure_var, ": ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(fit)) {
+    return(data.frame(cell_type = cell_type, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "coxph_fit_failed"))
+  }
+
+  zph <- tryCatch(cox.zph(fit), error = function(e) NULL)
+  if (is.null(zph)) {
+    return(data.frame(cell_type = cell_type, term = NA, chisq = NA, df = NA, p = NA,
+                       global_p = NA, note = "zph_failed"))
+  }
+
+  tab <- as.data.frame(zph$table)
+  tab$term <- rownames(tab)
+  global_p <- tab$p[tab$term == "GLOBAL"]
+
+  data.frame(
+    cell_type = cell_type, term = tab$term, chisq = round(tab$chisq, 3), df = tab$df,
+    p = round(tab$p, 4), global_p = round(global_p, 4), note = NA_character_
+  )
+}
+
+ph_RFS_maxstat <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_RFS, check_ph_RFS,
+           data = analysis_data, exposure_var = "Group_maxstat", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "maxstat", .after = cell_type)
+} else {
+  data.frame()
+}
+
+ph_RFS_median <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_RFS, check_ph_RFS,
+           data = analysis_data, exposure_var = "Group_median", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "median", .after = cell_type)
+} else {
+  data.frame()
+}
+
+# continuous PH check, exposure_var = "Fraction"
+ph_RFS_continuous <- if (length(selected_cell_types_RFS) > 0) {
+  bind_rows(
+    lapply(selected_cell_types_RFS, check_ph_RFS,
+           data = analysis_data, exposure_var = "Fraction", covariates = covariates_full)
+  ) %>% mutate(threshold_type = "continuous", .after = cell_type)
+} else {
+  data.frame()
+}
+
+ph_RFS_all <- bind_rows(ph_RFS_maxstat, ph_RFS_median, ph_RFS_continuous) %>%
+  arrange(cell_type, threshold_type, term)
+
+kable(ph_RFS_all)
+```
+
+
+
+
+
+
+#Boostrap
+```{r}
+# ============================================================================
+# BOOTSTRAP OPTIMISM CORRECTION -- RFS multivariable models
+# Re-derives the maxstat/median cutoff INSIDE each bootstrap resample
+# and also re-computes the apparent cutoff on the original dataset.
+# ============================================================================
+
+get_cutoff_RFS <- function(threshold_type, data) {
+  if (threshold_type == "maxstat") {
+    find_maxstat_cutoff("time_recurrence_surv_60m", "recurrence_60m", "Fraction", data)
+  } else {
+    median(data$Fraction, na.rm = TRUE)
+  }
+}
+
+bootstrap_cutoff_RFS <- function(cell_type_val,
+                                 threshold_type,
+                                 data,
+                                 covariates,
+                                 B = 200,
+                                 maxit_boot = 500,
+                                 maxstep_boot = 0.5,
+                                 seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(cell_type == cell_type_val)
+
+  df0 <- df0[
+    !is.na(df0$Fraction) &
+    !is.na(df0$time_recurrence_surv_60m) &
+    !is.na(df0$recurrence_60m),
+  ]
+
+  cutoff0 <- get_cutoff_RFS(threshold_type, df0)
+
+  if (is.na(cutoff0)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "cutoff_not_found"
+    ))
+  }
+
+  df0$Group <- factor(
+    ifelse(df0$Fraction > cutoff0, "High", "Low"),
+    levels = c("Low", "High")
+  )
+
+  if (nlevels(droplevels(df0$Group)) < 2) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "single_group"
+    ))
+  }
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ Group + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("GroupHigh" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"
+    ))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["GroupHigh"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    cutoff_b <- get_cutoff_RFS(threshold_type, dboot)
+    if (is.na(cutoff_b)) next
+
+    dboot$Group <- factor(ifelse(dboot$Fraction > cutoff_b, "High", "Low"),
+                           levels = c("Low", "High"))
+    if (nlevels(droplevels(dboot$Group)) < 2) next
+    ev_tab_boot <- table(dboot$Group, dboot$recurrence_60m)
+    if (ncol(ev_tab_boot) < 2 || any(ev_tab_boot[, 2] == 0)) next
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("GroupHigh" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["GroupHigh"])
+
+    df_test <- df0
+    df_test$Group <- factor(ifelse(df_test$Fraction > cutoff_b, "High", "Low"),
+                             levels = c("Low", "High"))
+    if (nlevels(droplevels(df_test$Group)) < 2) next
+    ev_tab_test <- table(df_test$Group, df_test$recurrence_60m)
+    if (ncol(ev_tab_test) < 2 || any(ev_tab_test[, 2] == 0)) next
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df_test, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("GroupHigh" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["GroupHigh"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = threshold_type,
+      HR_apparent = exp(beta_apparent), HR_corrected = NA,
+      HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+      B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+      elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"
+    ))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    cell_type = cell_type_val, threshold_type = threshold_type,
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+# ============================================================================
+# CONTINUOUS bootstrap for RFS -- mirrors bootstrap_continuous_DDS()
+# ============================================================================
+
+bootstrap_continuous_RFS <- function(cell_type_val,
+                                     data,
+                                     covariates,
+                                     B = 1000,
+                                     maxit_boot = 500,
+                                     maxstep_boot = 0.5,
+                                     seed = 1) {
+
+  t0 <- Sys.time()
+
+  df0 <- data %>%
+    filter(cell_type == cell_type_val,
+           !is.na(Fraction), !is.na(time_recurrence_surv_60m), !is.na(recurrence_60m))
+
+  fmla_boot <- as.formula(paste0(
+    "Surv(time_recurrence_surv_60m, recurrence_60m) ~ Fraction + ",
+    paste(covariates, collapse = " + ")
+  ))
+
+  fit_apparent <- tryCatch(
+    coxphf(fmla_boot, data = df0, maxstep = 0.0001, maxit = 100000, pl = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_apparent) || !("Fraction" %in% names(fit_apparent$coefficients))) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = "continuous",
+      HR_apparent = NA, HR_corrected = NA, HR_corrected_lower = NA,
+      HR_corrected_upper = NA, optimism = NA, B = B, n_valid_boot = 0,
+      pct_valid = 0, elapsed_sec = NA, error = "apparent_fit_failed"
+    ))
+  }
+
+  beta_apparent <- unname(fit_apparent$coefficients["Fraction"])
+
+  set.seed(seed)
+  n <- nrow(df0)
+  optimism_vec <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+
+    idx <- sample(seq_len(n), n, replace = TRUE)
+    dboot <- df0[idx, ]
+
+    fit_boot <- tryCatch(
+      coxphf(fmla_boot, data = dboot, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_boot) || !("Fraction" %in% names(fit_boot$coefficients))) next
+    beta_boot_apparent <- unname(fit_boot$coefficients["Fraction"])
+
+    fit_test <- tryCatch(
+      coxphf(fmla_boot, data = df0, maxstep = maxstep_boot, maxit = maxit_boot, pl = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit_test) || !("Fraction" %in% names(fit_test$coefficients))) next
+    beta_boot_test <- unname(fit_test$coefficients["Fraction"])
+
+    optimism_vec[b] <- beta_boot_apparent - beta_boot_test
+  }
+
+  valid_optimism <- optimism_vec[!is.na(optimism_vec)]
+  n_valid <- length(valid_optimism)
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  if (n_valid < max(10, 0.2 * B)) {
+    return(data.frame(
+      cell_type = cell_type_val, threshold_type = "continuous",
+      HR_apparent = exp(beta_apparent), HR_corrected = NA,
+      HR_corrected_lower = NA, HR_corrected_upper = NA, optimism = NA,
+      B = B, n_valid_boot = n_valid, pct_valid = round(100 * n_valid / B, 1),
+      elapsed_sec = round(elapsed, 1), error = "too_few_valid_bootstraps"
+    ))
+  }
+
+  mean_optimism <- mean(valid_optimism)
+  beta_corrected <- beta_apparent - mean_optimism
+  corrected_dist <- beta_apparent - valid_optimism
+  ci <- quantile(corrected_dist, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  data.frame(
+    cell_type = cell_type_val, threshold_type = "continuous",
+    HR_apparent = exp(beta_apparent), HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]), HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism, B = B, n_valid_boot = n_valid,
+    pct_valid = round(100 * n_valid / B, 1), elapsed_sec = round(elapsed, 1),
+    error = NA_character_
+  )
+}
+
+
+sig_maxstat_RFS <- multiv_RFS_selected %>%
+  filter(threshold_type == "maxstat", grepl("^Group_", variable), p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+sig_median_RFS <- multiv_RFS_selected %>%
+  filter(threshold_type == "median", grepl("^Group_", variable), p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+sig_continuous_RFS <- multiv_RFS_selected %>%
+  filter(threshold_type == "continuous", variable == "Fraction", p_adj_BH < 0.05) %>%
+  pull(cell_type) %>% unique()
+
+cat("Bootstrapping MAXSTAT RFS models for:\n"); print(sig_maxstat_RFS)
+cat("\nBootstrapping MEDIAN RFS models for:\n"); print(sig_median_RFS)
+cat("\nBootstrapping CONTINUOUS RFS models for:\n"); print(sig_continuous_RFS)
+```
+
+```{r}
+# ----------------------------------------------------------------------------
+# Timing test
+# ----------------------------------------------------------------------------
+
+t_test_RFS <- bootstrap_cutoff_RFS(
+  cell_type_val = sig_maxstat_RFS[1],
+  threshold_type = "maxstat",
+  data = analysis_data,
+  covariates = covariates_full,
+  B = 20
+)
+
+print(t_test_RFS)
+
+per_iter_sec <- t_test_RFS$elapsed_sec / 20
+n_models_RFS <- length(sig_maxstat_RFS) + length(sig_median_RFS) + length(sig_continuous_RFS)
+B_full_planned <- 1000
+est_total_min <- (per_iter_sec * B_full_planned * n_models_RFS) / 60
+
+cat(sprintf("Per-iteration time: ~%.3f sec\nEstimated full RFS run (B=%d, %d models): ~%.1f min\n",
+            per_iter_sec, B_full_planned, n_models_RFS, est_total_min))
+```
+
+
+```{r}
+# ----------------------------------------------------------------------------
+# Full bootstrap runs, guarded for empty selections
+# ----------------------------------------------------------------------------
+
+B_RFS <- 1000
+
+boot_RFS_maxstat <- if (length(sig_maxstat_RFS) > 0) {
+  bind_rows(lapply(sig_maxstat_RFS, bootstrap_cutoff_RFS,
+                    threshold_type = "maxstat", data = analysis_data,
+                    covariates = covariates_full, B = B_RFS))
+} else data.frame()
+
+boot_RFS_median <- if (length(sig_median_RFS) > 0) {
+  bind_rows(lapply(sig_median_RFS, bootstrap_cutoff_RFS,
+                    threshold_type = "median", data = analysis_data,
+                    covariates = covariates_full, B = B_RFS))
+} else data.frame()
+
+boot_RFS_continuous <- if (length(sig_continuous_RFS) > 0) {
+  bind_rows(lapply(sig_continuous_RFS, bootstrap_continuous_RFS,
+                    data = analysis_data, covariates = covariates_full, B = B_RFS))
+} else data.frame()
+
+boot_RFS_all <- bind_rows(boot_RFS_maxstat, boot_RFS_median, boot_RFS_continuous) %>%
+  arrange(cell_type, threshold_type)
+
+kable(boot_RFS_all)
+```
+
+
+
+```{r}
+forest_RFS <- make_optimism_forest_combined(boot_RFS_all, multiv_RFS_selected_formatted,
+                                             "RFS \u2014 bootstrap-corrected HRs, maxstat vs. median")
+
+forest_RFS_unadjusted <- make_forest_combined(
+  multiv_df = multiv_RFS_selected_formatted,
+  multiv_raw = multiv_RFS_selected,
+  title = "RFS — multivariable HRs, maxstat vs. median"
+)
+```
+

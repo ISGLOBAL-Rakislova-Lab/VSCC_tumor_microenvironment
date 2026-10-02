@@ -1,0 +1,881 @@
+
+#XCELL in HPV-I cases by p53 status
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(ComplexHeatmap)
+```
+
+
+
+```{r}
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+length(hpv_ind_xcell$cell_type)
+
+#We only obtain 39 cell types. This function automatically drops any cell type that has zero (or near-zero) signal across all samples, that's why we're seeing only 39 out of 64.
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c( "Sample"="id"))
+
+length(unique(analysis_data$cell_type))
+#We detect 39
+
+```
+
+```{r}
+# --- Step 1: Filter out unwanted score cell types and selected immune subsets ---
+exclude_celltypes <- c(
+  "microenvironment score", "immune score", "stroma score",
+"B cell naive",  
+"T cell CD4+ (non-regulatory)",
+ "T cell CD4+ memory",                       
+ "Mast cell",                                                       
+ "NK cell",
+"T cell CD8+ naive",
+"Monocyte",
+"T cell gamma delta",
+"Common lymphoid progenitor",     
+"Common myeloid progenitor", 
+"Granulocyte-monocyte progenitor")
+
+analysis_data <- analysis_data %>%
+  filter(!cell_type %in% exclude_celltypes)
+
+
+length(unique(analysis_data$cell_type))
+#We keep 25 (also for now excluding scores)
+```
+
+
+
+
+
+
+```{r}
+# Load necessary library
+library(RColorBrewer)
+
+# Create an extended color palette
+n_categories <- length(unique(analysis_data$cell_type))  # Calculate the number of unique cell types
+extended_palette <- colorRampPalette(brewer.pal(12, "Paired"))(n_categories)  # Extend the Paired palette
+
+
+p <- analysis_data %>%
+  ggplot(aes(x = Sample, y = Fraction, fill = cell_type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = extended_palette) +
+  theme_minimal() +
+  labs(
+    title = "XCELL Cell Fractions (Filtered Cell Types)",
+    x = "Sample",
+    y = "Fraction",
+    fill = "Cell Type"
+  )
+
+print(p)
+```
+
+
+
+
+#PCA
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Step 1: Filter out unwanted scores
+analysis_data_filtered <- analysis_data 
+
+# Step 2: Convert long to wide format (samples = rows, cell types = columns)
+pca_data <- analysis_data_filtered %>%
+  select(Sample, cell_type, Fraction) %>%
+  pivot_wider(
+    names_from = cell_type,
+    values_from = Fraction,
+    values_fill = 0  # fill missing fractions with 0
+  ) %>%
+  column_to_rownames("Sample")  # samples as rownames
+
+# Step 3: Ensure all columns are numeric
+pca_data[] <- lapply(pca_data, as.numeric)
+
+# Step 4: Perform PCA
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# Step 5: Extract PCA scores
+pca_df <- as.data.frame(pca_result$x)
+pca_df$Sample <- rownames(pca_df)
+
+# Optional: add metadata for coloring
+metadata <- analysis_data %>%
+  select(Sample, p53_ihc_status) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+pca_df <- pca_df %>%
+  left_join(metadata, by = "Sample")
+
+# Step 6: Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = p53_ihc_status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA of Filtered xCell Fractions",
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100,1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100,1), "%)")
+  ) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+
+
+#Create dataframe of explained variance
+```{r}
+explained_var <- summary(pca_result)$importance[2, ] * 100
+
+explained_df <- data.frame(
+  PC = names(explained_var),
+  VarianceExplained = as.numeric(explained_var)
+)
+
+explained_df
+```
+
+
+
+
+
+
+
+
+#Which clinical variables is more associated with variability? Linear models with PC
+```{r}
+merged_df <- merge(pca_df, TP53status_clinical, by.x = "Sample", by.y = "id")
+
+# We have two Hpv status, Keep the x version
+merged_df$p53_ihc_status <- merged_df$p53_ihc_status.x
+
+merged_df$p53_ihc_status <- relevel(factor(merged_df$p53_ihc_status), ref = "Wt")
+merged_df$tumor_size_category <- relevel(factor(merged_df$tumor_size_category), ref = "≤25 mm")
+merged_df$depth_invasion_category<- relevel(factor(merged_df$depth_invasion_category), ref = "≤5 mm")
+
+# Load necessary packages
+library(broom)
+
+# Perform linear regression and tidy the results for each principal component (PC)
+lm_results <- lapply(grep("^PC", names(merged_df), value = TRUE), function(pc) {
+  # Fit the linear model with the specified clinical variables
+  model <- lm(as.formula(paste(pc, "~ age + factor(figo_ini_ava) + factor(nodal_status) +factor(margins)+ factor(depth_invasion_category)+factor(tumor_size_category) + factor(p53_ihc_status)")), data = merged_df)
+  
+  # Tidy the model results
+  tidy_model <- tidy(model)
+  
+  # Add the PC name to each tidy output for reference
+  tidy_model$PC <- pc
+  
+  return(tidy_model)
+})
+
+# Combine all the results into one data frame
+lm_results_df <- do.call(rbind, lm_results)
+
+# View the results
+head(lm_results_df)
+```
+
+
+
+
+```{r}
+# Round numeric columns
+lm_results_df_rounded <- lm_results_df %>%
+  mutate(
+    estimate   = round(estimate, 2),
+    std.error  = round(std.error, 2),
+    statistic  = round(statistic, 2),
+    p.value    = round(p.value, 3)
+  )
+
+# Export to CSV
+write.csv(lm_results_df_rounded, 
+          file = "lm_results_HPV-I_p53_xcell.csv", 
+          row.names = FALSE)
+```
+
+
+```{r}
+ggplot(pca_df, aes(x = PC1, y = PC2, color = p53_ihc_status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA of Filtered xCell Fractions",
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2] * 100, 1), "%)")
+  ) +
+  theme_minimal() +
+  scale_color_manual(
+    values = c("Wt" = "#008837", "Mutant" = "#7B3294")
+  )
+
+```
+
+
+
+
+
+#Variables contributing to PC1 and PC2?
+```{r}
+# Assuming pca_result contains the PCA object with loadings
+# Extract the loadings for PC1 and PC2
+loadings <- pca_result$rotation  # Loadings are in the rotation matrix
+
+# Get the top 3 contributors to PC1 and PC2 (by absolute value)
+top_PC1 <- head(sort(abs(loadings[, 1]), decreasing = TRUE), 3)
+top_PC2 <- head(sort(abs(loadings[, 2]), decreasing = TRUE), 3)
+
+top_contributors <- data.frame(
+  Variable = c(names(top_PC1), names(top_PC2)),
+  PC = c(rep("PC1", 3), rep("PC2", 3)),
+  Loading = c(loadings[names(top_PC1), "PC1"], loadings[names(top_PC2), "PC2"])
+)
+top_contributors$Contribution_pct <- top_contributors$Loading^2 * 100
+
+# Plot the top loadings for PC1 and PC2 as percentages
+ggplot(top_contributors, aes(x = reorder(Variable, Contribution_pct), y = Contribution_pct, fill = PC)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("PC1" = "grey27", "PC2" = "grey50")) +
+  labs(title = "Top Contributions to PC1 and PC2 (%)", 
+       x = "Variable", 
+       y = "Contribution (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(10, 10, 10, 10),  # Adjust margins to reduce space
+        axis.text = element_text(size = 8),  # Smaller axis text
+        axis.title = element_text(size = 10), # Smaller axis titles
+        panel.grid = element_blank())  # Remove grid for a cleaner look
+
+
+```
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Step 1: Extract PCA scores (already in pca_hiv_df)
+pca_scores <- pca_df  # Assuming PC1 and PC2 are already in here
+
+# Step 2: Extract loadings (directions of variable contributions)
+loadings <- pca_result$rotation[, 1:2]  # Only PC1 and PC2
+
+# Step 3: Get top contributing variables to PC1 and PC2
+top_vars <- unique(c(names(top_PC1), names(top_PC2)))  # Combine top contributors
+
+# Scale loadings for visualization — use a constant or use your data's scale
+loading_df <- as.data.frame(loadings[top_vars, ])
+loading_df$Variable <- rownames(loading_df)
+
+
+p53_colors_custom <- c(
+  "Mutant" = "#7B3294",  # strong dark purple
+  "Wt"     = "#008837"   # strong green
+)
+
+
+# Step 4: Create PCA plot with arrows (biplot-style)
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = factor(p53_ihc_status))) +
+  geom_point(size = 3) +
+  # Add arrows for variable loadings
+  geom_segment(data = loading_df,
+               aes(x = 0, y = 0, xend = PC1 * 10, yend = PC2 * 10),  # scaled for visibility
+               arrow = arrow(length = unit(0.25, "cm")), color = "black") +
+  geom_text_repel(data = loading_df,
+                  aes(x = PC1 * 10, y = PC2 * 10, label = Variable), 
+                  color = "black", size = 3) +
+  labs(title = "PCA with Top Variable Contributions",
+       x = paste0("PC1 (", round(summary(pca_result)$importance[2,1] * 100, 1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_result)$importance[2,2] * 100, 1), "%)"),
+       color = "p53 Status") +
+  scale_color_manual(values = p53_colors_custom) +
+
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+```{r}
+# ============================================================
+# 1. Wilcoxon test per cell type + BH-FDR correction
+#    (mirrors `results_hpv` in the HPV-status script)
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(tidyr)
+library(tibble)
+library(ComplexHeatmap)
+
+# Ensure p53_ihc_status is treated as a factor
+analysis_data$p53_ihc_status <- factor(
+  analysis_data$p53_ihc_status,
+  levels = c("Wt", "Mutant")
+)
+
+# Perform Mann-Whitney U / Wilcoxon rank-sum test for each cell type
+results_p53 <- analysis_data %>%
+  filter(!is.na(p53_ihc_status), !is.na(Fraction)) %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_wt      = sum(p53_ihc_status == "Wt"),
+    n_mutant  = sum(p53_ihc_status == "Mutant"),
+    p_value   = wilcox.test(Fraction ~ p53_ihc_status)$p.value,
+    median_wt      = median(Fraction[p53_ihc_status == "Wt"], na.rm = TRUE),
+    median_mutant  = median(Fraction[p53_ihc_status == "Mutant"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Benjamini-Hochberg FDR correction across ALL tested cell types
+    FDR = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# View all results
+results_p53
+
+
+# ============================================================
+# 2. Keep only FDR-significant cell types
+#    (mirrors `significant_results` / `significant_data`)
+# ============================================================
+
+significant_results <- results_p53 %>%
+  filter(FDR < 0.05)
+
+significant_cell_types <- significant_results$cell_type
+
+significant_data <- analysis_data %>%
+  filter(cell_type %in% significant_cell_types) %>%
+  left_join(
+    significant_results %>%
+      select(cell_type, p_value, FDR, median_wt, median_mutant),
+    by = "cell_type"
+  )
+
+
+# ============================================================
+# 3. Boxplot/jitter panel of FDR-significant cell types
+#    (mirrors `HPVplot`)
+# ============================================================
+
+significant_results <- results_p53 %>%
+  filter(FDR < 0.05) %>%
+  arrange(FDR)
+
+significant_cell_types <- significant_results$cell_type
+
+analysis_data_significant <- analysis_data %>%
+  filter(
+    cell_type %in% significant_cell_types,
+    !is.na(p53_ihc_status),
+    !is.na(Fraction)
+  ) %>%
+  mutate(
+    cell_type = factor(cell_type, levels = significant_cell_types),
+    p53_ihc_status = factor(p53_ihc_status, levels = c("Wt", "Mutant"))
+  )
+
+# Check how many observations each cell type has
+table(analysis_data_significant$cell_type)
+
+plot_labels <- significant_results %>%
+  mutate(
+    cell_type = factor(cell_type, levels = significant_cell_types),
+    FDR_label = paste0("FDR = ", format.pval(FDR, digits = 2, eps = 0.001))
+  )
+
+p53plot <- ggplot(
+  analysis_data_significant,
+  aes(x = p53_ihc_status, y = Fraction, fill = p53_ihc_status)
+) +
+
+  geom_boxplot(width = 0.45, outlier.shape = NA) +
+
+  geom_jitter(
+    aes(color = p53_ihc_status),
+    width = 0.08,
+    size = 1.5,
+    alpha = 0.65
+  ) +
+
+  facet_wrap(
+    ~cell_type,
+    scales = "free_y",
+    nrow = 3,
+    ncol = 4
+  ) +
+
+  geom_text(
+    data = plot_labels,
+    aes(x = 1.5, y = Inf, label = FDR_label),
+    inherit.aes = FALSE,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+
+  scale_fill_manual(
+    values = c("Wt" = "#41AE76", "Mutant" = "#79419D")
+  ) +
+
+  scale_color_manual(
+    values = c("Wt" = "#2B6B4A", "Mutant" = "#4F2E6F")
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "Cell Type Fractions by p53 IHC Status (HPV-independent)",
+    x = "p53 IHC Status",
+    y = "xCell Score",
+    fill = "p53 IHC Status",
+    color = "p53 IHC Status"
+  ) +
+
+  theme(
+    panel.spacing = unit(0.8, "lines"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 11, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+p53plot
+
+#no cell type reached FDR < 0.05 in p53 comparison
+
+# ============================================================
+# 4. Heatmap: FDR-significant cell types only
+#    (mirrors the HPV-status heatmap section)
+# ============================================================
+
+significant_cell_types <- results_p53 %>%
+  filter(FDR < 0.05) %>%
+  arrange(FDR) %>%
+  pull(cell_type)
+
+print(significant_cell_types)
+length(significant_cell_types)
+
+heatmap_data <- analysis_data %>%
+  filter(
+    cell_type %in% significant_cell_types,
+    !is.na(Fraction),
+    !is.na(p53_ihc_status)
+  ) %>%
+  select(Sample, Fraction, cell_type, p53_ihc_status)
+
+table(heatmap_data$p53_ihc_status)
+table(heatmap_data$cell_type)
+
+data_grouped <- heatmap_data %>%
+  group_by(cell_type, Sample) %>%
+  summarise(Fraction = mean(Fraction, na.rm = TRUE), .groups = "drop")
+
+data_wide <- data_grouped %>%
+  pivot_wider(names_from = Sample, values_from = Fraction) %>%
+  column_to_rownames("cell_type")
+
+data_matrix <- as.matrix(data_wide)
+mode(data_matrix) <- "numeric"
+
+data_zscore <- t(
+  apply(data_matrix, 1, function(x) as.numeric(scale(x)))
+)
+rownames(data_zscore) <- rownames(data_matrix)
+colnames(data_zscore) <- colnames(data_matrix)
+
+sample_metadata <- heatmap_data %>%
+  distinct(Sample, p53_ihc_status) %>%
+  filter(Sample %in% colnames(data_zscore))
+
+# Reorder metadata to exactly match heatmap columns
+sample_metadata <- sample_metadata %>%
+  slice(match(colnames(data_zscore), Sample))
+
+stopifnot(sample_metadata$Sample == colnames(data_zscore))
+
+p53_colors_custom <- c("Wt" = "#008837", "Mutant" = "#7B3294")
+
+column_annotation <- HeatmapAnnotation(
+  p53_ihc_status = sample_metadata$p53_ihc_status,
+  col = list(p53_ihc_status = p53_colors_custom)
+)
+
+Heatmap(
+  data_zscore,
+  name = "Z-Score",
+
+  row_names_side = "left",
+  column_title = "Samples",
+  row_title = "FDR-significant cell types",
+
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+
+  clustering_distance_rows = "manhattan",
+  clustering_distance_columns = "manhattan",
+
+  clustering_method_rows = "ward.D2",
+  clustering_method_columns = "ward.D2",
+
+  top_annotation = column_annotation
+)
+```
+
+
+```{r}
+# ============================================================
+# 5. Scores (microenvironment / immune / stroma): FDR version
+#    (mirrors the "NOW for scores" section)
+# ============================================================
+
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(cols = -cell_type, names_to = "Sample", values_to = "Fraction")
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c("Sample" = "id"))
+
+scores_only <- c("microenvironment score", "immune score", "stroma score")
+
+analysis_data_scores <- analysis_data %>%
+  filter(cell_type %in% scores_only)
+
+unique(analysis_data_scores$cell_type)
+
+scores_data <- analysis_data_scores %>%
+  select(Sample, cell_type, Fraction, p53_ihc_status) %>%
+  filter(!is.na(p53_ihc_status), !is.na(Fraction)) %>%
+  mutate(p53_ihc_status = factor(p53_ihc_status, levels = c("Wt", "Mutant")))
+
+table(scores_data$p53_ihc_status)
+unique(scores_data$cell_type)
+
+# --- Wilcoxon tests + BH-FDR correction across the 3 xCell scores ---
+results_scores <- scores_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_wt     = sum(p53_ihc_status == "Wt"),
+    n_mutant = sum(p53_ihc_status == "Mutant"),
+    median_wt     = median(Fraction[p53_ihc_status == "Wt"], na.rm = TRUE),
+    median_mutant = median(Fraction[p53_ihc_status == "Mutant"], na.rm = TRUE),
+    p_value  = wilcox.test(Fraction ~ p53_ihc_status)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FDR = p.adjust(p_value, method = "BH"),
+    significant = FDR < 0.05
+  ) %>%
+  arrange(FDR)
+
+results_scores
+
+# --- Plot with FDR labels ---
+pale_colors_fill  <- c("Wt" = "#008837", "Mutant" = "#7B3294")
+pale_colors_color <- c("Wt" = "#2B6B4A", "Mutant" = "#4F2E6F")
+
+score_order <- c("microenvironment score", "immune score", "stroma score")
+
+scores_data <- scores_data %>%
+  mutate(cell_type = factor(cell_type, levels = score_order))
+
+
+
+# --- Plot labels with both nominal p-value and FDR ---
+score_labels <- results_scores %>%
+  mutate(
+    cell_type = factor(cell_type, levels = score_order),
+
+    p_label = case_when(
+      p_value < 0.01 ~ "p < 0.01",
+      TRUE ~ paste0("p = ", sprintf("%.2f", p_value))
+    ),
+
+    FDR_label = case_when(
+      FDR < 0.01 ~ "FDR < 0.01",
+      TRUE ~ paste0("FDR = ", sprintf("%.2f", FDR))
+    ),
+
+    label = paste0(
+      p_label,
+      "\n",
+      FDR_label
+    )
+  )
+
+
+p53plot_scores_FDR <- ggplot(
+  scores_data,
+  aes(
+    x = cell_type,
+    y = Fraction,
+    fill = p53_ihc_status
+  )
+) +
+
+  geom_boxplot(
+    width = 0.45,
+    outlier.shape = NA,
+    position = position_dodge(width = 0.6)
+  ) +
+
+  geom_jitter(
+    aes(color = p53_ihc_status),
+    size = 1.5,
+    alpha = 0.65,
+    position = position_jitterdodge(
+      jitter.width = 0.08,
+      dodge.width = 0.6
+    )
+  ) +
+
+  geom_text(
+    data = score_labels,
+    aes(
+      x = cell_type,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+
+  scale_fill_manual(
+    values = pale_colors_fill
+  ) +
+
+  scale_color_manual(
+    values = pale_colors_color
+  ) +
+
+  scale_x_discrete(
+    labels = c(
+      "microenvironment score" = "Microenvironment score",
+      "immune score" = "Immune score",
+      "stroma score" = "Stroma score"
+    )
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "xCell Scores by p53 IHC Status (HPV-independent)",
+    subtitle = "Nominal p-value and BH-adjusted FDR",
+    x = "Score Type",
+    y = "xCell Score",
+    fill = "p53 IHC Status",
+    color = "p53 IHC Status"
+  ) +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    plot.title = element_text(
+      size = 16,
+      face = "bold"
+    )
+  )
+
+p53plot_scores_FDR
+
+```
+
+
+
+
+
+```{r}
+# ============================================================
+# Plot individual cell types with nominal p < 0.1
+# ============================================================
+
+# Check the actual values first
+unique(analysis_data$p53_ihc_status)
+table(analysis_data$p53_ihc_status, useNA = "ifany")
+
+
+# Explicitly standardize p53 status
+analysis_data_nominal <- analysis_data %>%
+  filter(
+    !is.na(p53_ihc_status),
+    !is.na(Fraction)
+  ) %>%
+  mutate(
+    p53_ihc_status = case_when(
+      p53_ihc_status %in% c("Wt", "WT", "Wild-type", "Wild type") ~ "Wt",
+      p53_ihc_status %in% c("Mutant", "Mut", "MUT") ~ "Mutant",
+      TRUE ~ as.character(p53_ihc_status)
+    ),
+    p53_ihc_status = factor(
+      p53_ihc_status,
+      levels = c("Wt", "Mutant")
+    )
+  ) %>%
+  filter(!is.na(p53_ihc_status))
+
+
+# Cell types with nominal p < 0.1
+nominal_results <- results_p53 %>%
+  filter(p_value < 0.1) %>%
+  arrange(p_value)
+
+nominal_cell_types <- nominal_results$cell_type
+
+
+# Keep only these cell types
+analysis_data_nominal <- analysis_data_nominal %>%
+  filter(cell_type %in% nominal_cell_types) %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = nominal_cell_types
+    )
+  )
+
+
+# Labels
+plot_labels_nominal <- nominal_results %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = nominal_cell_types
+    ),
+    p_label = paste0(
+      "p = ", format.pval(p_value, digits = 2, eps = 0.001),
+      "\nFDR = ", format.pval(FDR, digits = 2, eps = 0.001)
+    )
+  )
+
+
+# Plot
+p53plot_nominal <- ggplot(
+  analysis_data_nominal,
+  aes(
+    x = p53_ihc_status,
+    y = Fraction,
+    fill = p53_ihc_status
+  )
+) +
+
+  geom_boxplot(
+    width = 0.45,
+    outlier.shape = NA
+  ) +
+
+  geom_jitter(
+    aes(color = p53_ihc_status),
+    width = 0.08,
+    size = 1.5,
+    alpha = 0.65
+  ) +
+
+  facet_wrap(
+    ~cell_type,
+    scales = "free_y",
+    nrow = 3,
+    ncol = 4
+  ) +
+
+  geom_text(
+    data = plot_labels_nominal,
+    aes(
+      x = 1.5,
+      y = Inf,
+      label = p_label
+    ),
+    inherit.aes = FALSE,
+    vjust = 1.5,
+    size = 3.2
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Wt" = "#41AE76",
+      "Mutant" = "#79419D"
+    ),
+    drop = FALSE
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Wt" = "#2B6B4A",
+      "Mutant" = "#4F2E6F"
+    ),
+    drop = FALSE
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "xCell Fractions by p53 IHC Status",
+    subtitle = "Cell types with nominal Wilcoxon p < 0.1",
+    x = "p53 IHC Status",
+    y = "xCell Score",
+    fill = "p53 IHC Status",
+    color = "p53 IHC Status"
+  ) +
+
+  theme(
+    panel.spacing = unit(0.8, "lines"),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.text = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    plot.title = element_text(
+      size = 16,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      size = 12
+    )
+  )
+
+p53plot_nominal
+```
+
+

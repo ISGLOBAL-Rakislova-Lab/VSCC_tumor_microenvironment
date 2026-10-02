@@ -1,0 +1,543 @@
+
+#QTI in all cases by HPV status
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(ggrepel)
+library(grid)
+library(scales) 
+library(edgeR)
+```
+
+
+
+
+```{r}
+# convert to matrix (important for many bioinformatics tools)
+counts_mat <- as.matrix(counts_filtered_filtered)
+
+# remove duplicated gene symbols if any
+counts_mat <- counts_mat[!duplicated(rownames(counts_mat)), ]
+
+# create edgeR object
+dge <- DGEList(counts = counts_mat)
+
+# TMM normalization (library size normalization)
+dge <- calcNormFactors(dge)
+
+# CPM expression matrix
+cpm_mat <- cpm(dge, log = FALSE)
+```
+
+
+```{r}
+qti <- deconvolute(cpm_mat, "quantiseq")
+length(qti$cell_type)
+
+
+qti_long <- qti %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- qti_long %>%
+  left_join(TP53status_clinical, by = c( "Sample"="id"))
+```
+
+
+
+```{r}
+length(unique(analysis_data$cell_type))
+# we have 11 cell types
+
+unique(analysis_data$cell_type)
+# [1] "B cell"                       "Macrophage M1"               
+# [3] "Macrophage M2"                "Monocyte"                    
+# [5] "Neutrophil"                   "NK cell"                     
+# [7] "T cell CD4+ (non-regulatory)" "T cell CD8+"                 
+# [9] "T cell regulatory (Tregs)"    "Myeloid dendritic cell"      
+#[11] "uncharacterized cell" 
+
+analysis_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    prevalence = mean(Fraction > 0.01),
+    median = median(Fraction),
+    mean = mean(Fraction)
+  ) %>%
+  arrange(prevalence)
+```
+
+
+
+
+```{r}
+filtered_cell_types <- analysis_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    prevalence = mean(Fraction > 0.01),
+    median_value = median(Fraction)
+  ) %>%
+  filter(prevalence >= 0.10) %>%
+  pull(cell_type)
+
+analysis_data <- analysis_data %>%
+  filter(cell_type %in% filtered_cell_types)
+
+length(unique(analysis_data$cell_type))
+#10 cell types we keep
+
+unique(analysis_data$cell_type)
+# [1] "B cell"                       "Macrophage M1"                "Macrophage M2"               
+# [4] "Neutrophil"                   "NK cell"                      "T cell CD4+ (non-regulatory)"
+# [7] "T cell CD8+"                  "T cell regulatory (Tregs)"    "Myeloid dendritic cell"      
+#[10] "uncharacterized cell"" 
+```
+
+```{r}
+p<-analysis_data %>%
+  ggplot(aes(x = Fraction)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  facet_wrap(~ cell_type, scales = "free_x") +
+  theme_minimal() +
+  labs(title = "Distribution of Cell Fractions Across Cell Types",
+       x = "Fraction",
+       y = "Count")
+p
+
+length(unique(analysis_data$cell_type))
+#10
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#PCA
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Step 1: Filter out unwanted scores
+analysis_data_filtered <- analysis_data 
+
+# Step 2: Convert long to wide format (samples = rows, cell types = columns)
+pca_data <- analysis_data_filtered %>%
+  select(Sample, cell_type, Fraction) %>%
+  pivot_wider(
+    names_from = cell_type,
+    values_from = Fraction,
+    values_fill = 0  # fill missing fractions with 0
+  ) %>%
+  column_to_rownames("Sample")  # samples as rownames
+
+# Step 3: Ensure all columns are numeric
+pca_data[] <- lapply(pca_data, as.numeric)
+
+# Step 4: Perform PCA
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# Step 5: Extract PCA scores
+pca_df <- as.data.frame(pca_result$x)
+pca_df$Sample <- rownames(pca_df)
+
+# Optional: add metadata for coloring
+metadata <- analysis_data %>%
+  select(Sample, hpv_status) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+pca_df <- pca_df %>%
+  left_join(metadata, by = "Sample")
+
+# Step 6: Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = hpv_status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA of Filtered qti Fractions",
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100,1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100,1), "%)")
+  ) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+
+
+```
+
+#Create dataframe of explained variance
+```{r}
+explained_var <- summary(pca_result)$importance[2, ] * 100
+
+explained_df <- data.frame(
+  PC = names(explained_var),
+  VarianceExplained = as.numeric(explained_var)
+)
+
+explained_df
+```
+
+#Which clinical variables is more associated with variability? Linear models with PC
+```{r}
+merged_df <- merge(pca_df, TP53status_clinical, by.x = "Sample", by.y = "id")
+
+# We have two Hpv status, Keep the x version
+merged_df$hpv_status <- merged_df$hpv_status.x
+
+merged_df$p53_ihc_status <- relevel(factor(merged_df$p53_ihc_status), ref = "Wt")
+merged_df$tumor_size_category <- relevel(factor(merged_df$tumor_size_category), ref = "≤25 mm")
+merged_df$depth_invasion_category<- relevel(factor(merged_df$depth_invasion_category), ref = "≤5 mm")
+
+
+
+# Load necessary packages
+library(broom)
+
+# Perform linear regression and tidy the results for each principal component (PC)
+lm_results <- lapply(grep("^PC", names(merged_df), value = TRUE), function(pc) {
+  # Fit the linear model with the specified clinical variables
+  model <- lm(as.formula(paste(pc, "~ age + factor(figo_ini_ava) + factor(nodal_status) + factor(hpv_status) +factor(margins)+ factor(depth_invasion_category)+factor(tumor_size_category) + factor(p53_ihc_status)")), data = merged_df)
+  
+  # Tidy the model results
+  tidy_model <- tidy(model)
+  
+  # Add the PC name to each tidy output for reference
+  tidy_model$PC <- pc
+  
+  return(tidy_model)
+})
+
+# Combine all the results into one data frame
+lm_results_df <- do.call(rbind, lm_results)
+
+# View the results
+head(lm_results_df)
+```
+```{r}
+# Round numeric columns
+lm_results_df_rounded <- lm_results_df %>%
+  mutate(
+    estimate   = round(estimate, 2),
+    std.error  = round(std.error, 2),
+    statistic  = round(statistic, 2),
+    p.value    = round(p.value, 3)
+  )
+
+# Export to CSV
+write.csv(lm_results_df_rounded, 
+          file = "lm_results_HPV_QTI.csv", 
+          row.names = FALSE)
+```
+
+
+
+
+
+#Variables contributing to PC1 and PC2?
+```{r}
+# Assuming pca_result contains the PCA object with loadings
+# Extract the loadings for PC1 and PC2
+loadings <- pca_result$rotation  # Loadings are in the rotation matrix
+
+# Get the top 3 contributors to PC1 and PC2 (by absolute value)
+top_PC1 <- head(sort(abs(loadings[, 1]), decreasing = TRUE), 3)
+top_PC2 <- head(sort(abs(loadings[, 2]), decreasing = TRUE), 3)
+
+# Combine these results for display and rename the first column as 'Variable'
+top_contributors <- data.frame(
+  Variable = c(names(top_PC1), names(top_PC2)),
+  PC = c(rep("PC1", 3), rep("PC2", 3)),
+  Loading = c(loadings[names(top_PC1), "PC1"], loadings[names(top_PC2), "PC2"])
+)
+
+top_contributors$Contribution_pct <- top_contributors$Loading^2 * 100
+
+
+# Plot the top loadings for PC1 and PC2 as percentages
+ggplot(top_contributors, aes(x = reorder(Variable, Percentage), y = Percentage, fill = PC)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("PC1" = "grey27", "PC2" = "grey50")) +
+  labs(title = "Top Contributions to PC1 and PC2 (%)", 
+       x = "Variable", 
+       y = "Contribution (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(10, 10, 10, 10),  # Adjust margins to reduce space
+        axis.text = element_text(size = 8),  # Smaller axis text
+        axis.title = element_text(size = 10), # Smaller axis titles
+        panel.grid = element_blank())  # Remove grid for a cleaner look
+
+
+```
+
+
+
+
+#Final plot with top3 variables contributing to PC1 and PC2
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Step 1: Extract PCA scores (already in pca_hiv_df)
+pca_scores <- pca_df  # Assuming PC1 and PC2 are already in here
+
+# Step 2: Extract loadings (directions of variable contributions)
+loadings <- pca_result$rotation[, 1:2]  # Only PC1 and PC2
+
+# Step 3: Get top contributing variables to PC1 and PC2
+top_vars <- unique(c(names(top_PC1), names(top_PC2)))  # Combine top contributors
+
+# Scale loadings for visualization — use a constant or use your data's scale
+loading_df <- as.data.frame(loadings[top_vars, ])
+loading_df$Variable <- rownames(loading_df)
+
+
+# Your pale colors for HPV status
+hpv_colors_custom <- c(
+  "Positive" = "#FF9999",  # pale red (HPV-associated)
+  "Negative" = "#9999FF"   # pale blue (HPV-independent)
+)
+
+
+# Step 4: Create PCA plot with arrows (biplot-style)
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = factor(hpv_status))) +
+  geom_point(size = 3) +
+  # Add arrows for variable loadings
+  geom_segment(data = loading_df,
+               aes(x = 0, y = 0, xend = PC1 * 10, yend = PC2 * 10),  # scaled for visibility
+               arrow = arrow(length = unit(0.25, "cm")), color = "black") +
+  geom_text_repel(data = loading_df,
+                  aes(x = PC1 * 10, y = PC2 * 10, label = Variable), 
+                  color = "black", size = 3) +
+  labs(title = "PCA with Top Variable Contributions",
+       x = paste0("PC1 (", round(summary(pca_result)$importance[2,1] * 100, 1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_result)$importance[2,2] * 100, 1), "%)"),
+       color = "HPV Status") +
+  scale_color_manual(values = hpv_colors_custom,
+                     labels = c("Negative" = "HPV-independent", 
+                                "Positive" = "HPV-associated")) +
+
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Calculate significnat cell types
+
+
+
+
+
+#REVIEW
+```{r}
+# ============================================================
+# FDR-corrected comparison of QTI (quanTIseq) fractions by HPV status
+# (same approach as used for xCell / EPIC / MCP-counter)
+# ============================================================
+
+# Ensure HPV status is treated as a factor
+analysis_data$hpv_status <- factor(
+  analysis_data$hpv_status,
+  levels = c("Positive", "Negative")
+)
+
+# Perform Mann-Whitney U / Wilcoxon rank-sum test for each cell type
+results_hpv_qti <- analysis_data %>%
+  filter(!is.na(hpv_status), !is.na(Fraction)) %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_positive = sum(hpv_status == "Positive"),
+    n_negative = sum(hpv_status == "Negative"),
+    p_value = wilcox.test(Fraction ~ hpv_status)$p.value,
+    median_positive = median(Fraction[hpv_status == "Positive"], na.rm = TRUE),
+    median_negative = median(Fraction[hpv_status == "Negative"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Benjamini-Hochberg FDR correction across ALL tested cell types
+    FDR = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# View all results
+results_hpv_qti
+
+```
+
+
+```{r}
+# ============================================================
+# 1. Get FDR-significant cell types (QTI)
+# ============================================================
+
+significant_results_qti <- results_hpv_qti %>%
+  filter(FDR < 0.05) %>%
+  arrange(FDR)
+
+significant_cell_types_qti <- significant_results_qti$cell_type
+
+
+# ============================================================
+# 2. Prepare plotting data
+# ============================================================
+
+analysis_data_qti_significant <- analysis_data %>%
+  filter(
+    cell_type %in% significant_cell_types_qti,
+    !is.na(hpv_status),
+    !is.na(Fraction)
+  ) %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = significant_cell_types_qti
+    ),
+    hpv_status = factor(
+      hpv_status,
+      levels = c("Positive", "Negative")
+    )
+  )
+
+
+# ============================================================
+# 3. Prepare FDR labels
+# ============================================================
+
+plot_labels_qti <- significant_results_qti %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = significant_cell_types_qti
+    ),
+    FDR_label = paste0(
+      "FDR = ",
+      format.pval(FDR, digits = 2, eps = 0.001)
+    )
+  )
+
+
+# ============================================================
+# 4. Plot
+# ============================================================
+
+QTIplot_sig <- ggplot(
+  analysis_data_qti_significant,
+  aes(
+    x = hpv_status,
+    y = Fraction,
+    fill = hpv_status
+  )
+) +
+
+geom_boxplot(
+  width = 0.45,
+  outlier.shape = NA
+) +
+
+geom_jitter(
+  aes(color = hpv_status),
+  width = 0.08,
+  size = 1.5,
+  alpha = 0.65
+) +
+
+facet_wrap(
+  ~cell_type,
+  scales = "free_y"
+) +
+
+  geom_text(
+    data = plot_labels_qti,
+    aes(
+      x = 1.5,
+      y = Inf,
+      label = FDR_label
+    ),
+    inherit.aes = FALSE,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#FF9999",
+      "Negative" = "#9999FF"
+    )
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Positive" = "#FF6666",
+      "Negative" = "#6666CC"
+    )
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "Significant QTI Cell Type Fractions by HPV Status",
+    x = "HPV Status",
+    y = "QTI Score",
+    fill = "HPV Status",
+    color = "HPV Status"
+  ) +
+
+  theme(
+    panel.spacing = unit(0.8, "lines"),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.text = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    plot.title = element_text(
+      size = 16,
+      face = "bold"
+    )
+  )
+
+QTIplot_sig
+```
+
+
+
+
+
+

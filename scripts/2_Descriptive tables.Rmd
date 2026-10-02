@@ -1,0 +1,203 @@
+
+
+# **NORMALITY TESTS**
+#We perform Anderson-Darling tests to examine the distribution of the numerical variables
+
+# Install the packages if not already installed
+```{r packages}
+library(gtsummary)
+library(magrittr)
+library(nortest)
+library(knitr)
+library(dplyr)
+```
+
+
+# Normality in continuous variables, we choose Ad test because we have a datset n>50: "For larger datasets (n>50), other tests like the Kolmogorov-Smirnov test, Anderson-Darling test, or Lilliefors test may be more robust alternatives".
+```{r}
+numeric_data <- select_if(TP53status_clinical, is.numeric)
+print(colnames(numeric_data))
+
+#We define the numeric columns to test for normality
+columns_to_test <- colnames(numeric_data)
+
+#We create an empty dataframe to store results
+results_df <- data.frame(Column = character(),
+                         Test_utilizado = character(),
+                         Valor_p = numeric(),
+                         stringsAsFactors = FALSE)
+
+#We define a loop to check normality in the previously defined columns
+for (col in columns_to_test) {
+  #Test Anderson-Darling:
+  ad_test <- ad.test(TP53status_clinical[[col]])
+  
+  #Interpretation
+  if (ad_test$p.value < 0.05) {
+    normality <- "Distribución no normal"
+  } else {
+    normality <- "Distribución normal"
+  }
+  
+  #We add the results into the created empty dataframe
+  results_df <- rbind(results_df, data.frame(Variable = col,
+                                             Test_utilizado= "Anderson-Darling",
+                                             Valor_p = round(ad_test$p.value, digits = 3),
+                                             Interpretación = normality))
+}
+
+#We print the results
+knitr::kable(results_df, caption = "Resumen estadísticos normalidad")
+```
+
+
+#As we see that all variables are non-normal, we will perform Mann–Whitney U test in all the comparisons for numeric variables. Mann–Whitney U test, also called Mann–Whitney–Wilcoxon (MWW/MWU), Wilcoxon rank-sum test, or Wilcoxon–Mann–Whitney test) is a nonparametric test appropiate for non-normal variables.
+
+
+
+# **DESCRIPTIVE TABLES**
+```{r}
+#Select the variables of interest
+descriptive_HTG <- TP53status_clinical %>% select(
+    "hpv_status",
+    "age",
+    "figo_ini_ava",
+    "tumor_size",
+    "tumor_size_category",
+    "depth_invasion",
+    "depth_invasion_category",
+    "hist_type_category",
+    "vli", #Vascular lymphatic invasion (VLI)
+    "nodal_status",#Lymph node status
+    "margins",
+    "radiotherapy",
+    "surgery_type_category",
+    "p53_ihc_status",
+    "time_death_surv_60m", #this is time until lastfollow up up with a threshold of 60m
+    "death_disease_60m",
+    "time_recurrence_surv_60m",
+    "recurrence_60m",
+    "time_last_followup"
+    )
+```
+
+
+
+
+
+
+#We create a summary table, we do fisher test for categorical as we know that most of the variables contain less than 5 observations in one of the groups
+```{r}
+library(gtsummary)
+library(webshot)
+library(dplyr)
+library(remotes)
+
+descriptive_table_HTG <- descriptive_HTG %>%
+  tbl_summary(
+    by = "hpv_status",  # Quote the column name explicitly
+    statistic = list(
+      all_categorical() ~ "{n} / {N} ({p}%)",  # Ensure counts and percentages are formatted properly
+      all_continuous() ~ "{median} ({p25}, {p75})"  # Display medians and percentiles for continuous variables
+    ),
+    type = list(  # Explicitly set categorical variables
+      pdl1_immune_cells_pos ~ "continuous",  # Explicitly define as continuous
+      figo_ini_ava ~ "categorical",
+      tumor_size_category ~ "categorical",
+      depth_invasion_category ~ "categorical",
+      hist_type_category ~ "categorical",
+      vli ~ "categorical",
+      nodal_status ~ "categorical",
+      margins ~ "categorical",
+      radiotherapy ~ "categorical",
+      surgery_type_category ~ "categorical",
+      p53_ihc_status ~ "categorical",
+      recurrence_60m ~ "categorical",  # Ensure recurrence_60m is treated as categorical
+      death_disease_60m ~ "categorical"  # Ensure death_disease_60m is treated as categorical
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 0, 1),  # Set counts (n, N) as integers and percentages (p) with one decimal
+      all_continuous() ~ 1  # One decimal for continuous variables
+    )
+  ) %>%
+add_p(
+    test = list(
+      all_categorical() ~ function(data, variable, by, ...) {
+        # Fisher test with simulated p-value
+        result <- fisher.test(data[[variable]], data[[by]], simulate.p.value = TRUE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      },
+      all_continuous() ~ function(data, variable, by, ...) {
+        # Wilcoxon test with approximate p-value
+        result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      }
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  )
+descriptive_table_HTG
+```
+
+
+
+
+#We create a summary table within only HPV-Independent group by p53 ihc status.
+```{r}
+library(gtsummary)
+library(dplyr)
+
+# 1️⃣ Filter dataset to HPV-negative cases only
+descriptive_HTG_neg <- descriptive_HTG %>%
+  filter(hpv_status == "Negative")
+
+# 2️⃣ Create summary table comparing p53_ihc_status groups
+descriptive_table_HTG_neg <- descriptive_HTG_neg %>%
+  tbl_summary(
+    by = "p53_ihc_status",  # compare Wt vs Mutant
+    statistic = list(
+      all_categorical() ~ "{n} / {N} ({p}%)",
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    type = list(
+      pdl1_immune_cells_pos ~ "continuous",
+      figo_ini_ava ~ "categorical",
+      tumor_size_category ~ "categorical",
+      depth_invasion_category ~ "categorical",
+      hist_type_category ~ "categorical",
+      vli ~ "categorical",
+      nodal_status ~ "categorical",
+      margins ~ "categorical",
+      radiotherapy ~ "categorical",
+      surgery_type_category ~ "categorical",
+      recurrence_60m ~ "categorical",
+      death_disease_60m ~ "categorical"
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 0, 1),
+      all_continuous() ~ 1
+    )
+  ) %>%
+  add_p(
+    test = list(
+      all_categorical() ~ function(data, variable, by, ...) {
+        result <- fisher.test(data[[variable]], data[[by]], simulate.p.value = TRUE)
+        tibble::tibble(p.value = result$p.value)
+      },
+      all_continuous() ~ function(data, variable, by, ...) {
+        result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+        tibble::tibble(p.value = result$p.value)
+      }
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  )
+
+# 3️⃣ Show the final summary table
+descriptive_table_HTG_neg
+
+```
+
+
+
+
+
+

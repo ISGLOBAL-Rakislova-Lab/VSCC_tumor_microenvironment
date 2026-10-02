@@ -1,0 +1,291 @@
+
+# MCP counter in HPV-I cases by PDL1
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(stringr)
+library(edgeR)
+```
+
+
+
+  
+
+```{r}
+# convert to matrix (important for many bioinformatics tools)
+counts_mat <- as.matrix(counts_HPV_Independent)
+
+# remove duplicated gene symbols if any
+counts_mat <- counts_mat[!duplicated(rownames(counts_mat)), ]
+
+# create edgeR object
+dge <- DGEList(counts = counts_mat)
+
+# TMM normalization (library size normalization)
+dge <- calcNormFactors(dge)
+
+# CPM expression matrix
+cpm_mat <- cpm(dge, log = FALSE)
+```
+
+
+```{r}
+mcp_counter <- deconvolute(cpm_mat, "mcp_counter")
+length(mcp_counter$cell_type)
+
+
+mcp_counter_long <- mcp_counter %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- mcp_counter_long %>%
+  left_join(TP53status_clinical, by = c( "Sample"="id"))
+```
+
+```{r}
+length(unique(analysis_data$cell_type))
+# we have 9 cell types
+
+unique(analysis_data$cell_type)
+#[1] "T cell"                       "cytotoxicity score"          
+#[3] "NK cell"                      "B cell"                      
+#[5] "Monocyte"                     "Macrophage/Monocyte"         
+#[7] "Neutrophil"                   "Endothelial cell"            
+#[9] "Cancer associated fibroblast"
+
+analysis_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    prevalence = mean(Fraction > 0.01),
+    median = median(Fraction),
+    mean = mean(Fraction)
+  ) %>%
+  arrange(prevalence)
+```
+```{r}
+filtered_cell_types <- analysis_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    prevalence = mean(Fraction > 0.01),
+    median_value = median(Fraction)
+  ) %>%
+  filter(prevalence >= 0.10) %>%
+  pull(cell_type)
+
+analysis_data <- analysis_data %>%
+  filter(cell_type %in% filtered_cell_types)
+
+length(unique(analysis_data$cell_type))
+#[1] 9
+
+unique(analysis_data$cell_type)
+#[1] "T cell"                       "cytotoxicity score"           "NK cell"                     
+#[4] "B cell"                       "Monocyte"                     "Macrophage/Monocyte"         
+#[7] "Neutrophil"                   "Endothelial cell"             "Cancer associated fibroblast"
+```
+
+```{r}
+p<-analysis_data %>%
+  ggplot(aes(x = Fraction)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  facet_wrap(~ cell_type, scales = "free_x") +
+  theme_minimal() +
+  labs(title = "Distribution of Cell Fractions Across Cell Types",
+       x = "Fraction",
+       y = "Count")
+p
+
+length(unique(analysis_data$cell_type))
+#We keep 9
+```
+
+
+
+
+
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(tidyr)
+library(tibble)
+library(stringr)
+
+
+# ============================================================
+# 0. Prepare PDL1 status (drop "Unknown", set factor levels)
+# ============================================================
+
+analysis_data_pdl1 <- analysis_data %>%
+  filter(pdl1_immune_cells_pos_category != "Unknown") %>%
+  mutate(
+    pdl1_immune_cells_pos_category = factor(
+      pdl1_immune_cells_pos_category,
+      levels = c("Negative", "Positive")
+    )
+  )
+
+
+# ============================================================
+# 1. Wilcoxon test per cell type + BH-FDR correction
+#    (mirrors `results_hpv` / the corrected `results_p53`)
+# ============================================================
+
+results_pdl1 <- analysis_data_pdl1 %>%
+  filter(!is.na(pdl1_immune_cells_pos_category), !is.na(Fraction)) %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_negative = sum(pdl1_immune_cells_pos_category == "Negative"),
+    n_positive = sum(pdl1_immune_cells_pos_category == "Positive"),
+    p_value    = wilcox.test(Fraction ~ pdl1_immune_cells_pos_category)$p.value,
+    median_negative = median(Fraction[pdl1_immune_cells_pos_category == "Negative"], na.rm = TRUE),
+    median_positive = median(Fraction[pdl1_immune_cells_pos_category == "Positive"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Benjamini-Hochberg FDR correction across ALL MCP-counter cell types tested
+    FDR = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# View all results
+results_pdl1
+
+
+# ============================================================
+# 2. Keep only FDR-significant cell types
+# ============================================================
+
+significant_results <- results_pdl1 %>%
+  filter(FDR < 0.05)
+
+significant_cell_types <- significant_results$cell_type
+
+significant_data <- analysis_data_pdl1 %>%
+  filter(cell_type %in% significant_cell_types) %>%
+  left_join(
+    significant_results %>%
+      select(cell_type, p_value, FDR, median_negative, median_positive),
+    by = "cell_type"
+  )
+
+
+# ============================================================
+# 3. Boxplot/jitter panel of FDR-significant cell types
+#    (guarded: MCP-counter has few features, so this may
+#    legitimately come back empty after correction)
+# ============================================================
+
+if (length(significant_cell_types) == 0) {
+
+  message("No MCP-counter features reached FDR < 0.05 for PDL1 status within HPV-independent tumors.")
+
+} else {
+
+  analysis_data_significant <- analysis_data_pdl1 %>%
+    filter(
+      cell_type %in% significant_cell_types,
+      !is.na(pdl1_immune_cells_pos_category),
+      !is.na(Fraction)
+    ) %>%
+    mutate(
+      cell_type = factor(cell_type, levels = significant_cell_types),
+      pdl1_immune_cells_pos_category = factor(
+        pdl1_immune_cells_pos_category,
+        levels = c("Negative", "Positive")
+      )
+    )
+
+  # Check how many observations each cell type has
+  print(table(analysis_data_significant$cell_type))
+
+  plot_labels <- significant_results %>%
+    mutate(
+      cell_type = factor(cell_type, levels = significant_cell_types),
+      FDR_label = paste0("FDR = ", format.pval(FDR, digits = 2, eps = 0.001))
+    )
+
+  mcp_PDL1plot <- ggplot(
+    analysis_data_significant,
+    aes(x = pdl1_immune_cells_pos_category, y = Fraction, fill = pdl1_immune_cells_pos_category)
+  ) +
+
+    geom_boxplot(width = 0.45, outlier.shape = NA) +
+
+    geom_jitter(
+      aes(color = pdl1_immune_cells_pos_category),
+      width = 0.08,
+      size = 1.5,
+      alpha = 0.65
+    ) +
+
+    facet_wrap(
+      ~cell_type,
+      scales = "free_y",
+      nrow = 2,
+      ncol = 4
+    ) +
+
+    geom_text(
+      data = plot_labels,
+      aes(x = 1.5, y = Inf, label = FDR_label),
+      inherit.aes = FALSE,
+      vjust = 1.5,
+      size = 3.5
+    ) +
+
+    scale_fill_manual(
+      values = c("Negative" = "skyblue1", "Positive" = "skyblue4")
+    ) +
+
+    scale_color_manual(
+      values = c("Negative" = "dodgerblue3", "Positive" = "darkblue")
+    ) +
+
+    theme_minimal() +
+
+    labs(
+      title = "MCP-counter Cell Type Fractions by PDL1 Status (HPV-independent)",
+      x = "PDL1 Immune Cells Status",
+      y = "MCP-counter Score",
+      fill = "PDL1 Status",
+      color = "PDL1 Status"
+    ) +
+
+    theme(
+      panel.spacing = unit(0.8, "lines"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 11, face = "bold"),
+      plot.title = element_text(size = 16, face = "bold")
+    ) +
+
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+
+  print(mcp_PDL1plot)
+}
+
+
+
+```
+
+
+
+
+
+
+
+

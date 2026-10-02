@@ -1,0 +1,4313 @@
+#Validation IHC CD163
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(gridExtra)
+library(scales)
+```
+
+```{r}
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c( "Sample"="id"))
+
+```
+
+
+
+```{r}
+CD163 <- read_excel("Validation_CD163.xlsx", 
+     col_types = c("text", "numeric", 
+         "numeric", "numeric", "text"))
+
+# Convert "NA" strings to actual NA in character columns
+CD163 <- CD163 %>%
+  mutate(across(where(is.character), ~ na_if(., "NA"))) %>%
+  select(-Observations) %>%  # Remove the "Observations" column
+  filter(rowSums(is.na(select(., -`Case_ID`))) < (ncol(.) - 1))  # Remove rows where all other columns are NA
+
+# View cleaned dataset
+print(CD163)
+
+
+
+# Subset data for Macrophage M2
+macrophage_m2_data <- analysis_data %>% 
+  filter(cell_type == "Macrophage M2")
+
+
+#We check the ones that are not in the other datset:
+#Find which IDs are in CD163$Case_ID but not in macrophage_m2_data$Sample
+setdiff(CD163$Case_ID, macrophage_m2_data$Sample)
+
+#Find which IDs are in macrophage_m2_data$Sample but not in CD163$Case_ID
+setdiff(macrophage_m2_data$Sample, CD163$Case_ID)
+
+#2 cases
+
+
+merged_data <- merge(CD163, macrophage_m2_data, 
+                     by.x = "Case_ID", by.y = "Sample")
+
+dim(merged_data)
+#50 cases
+```
+
+
+
+
+
+```{r}
+# Use anti_join to get cases from CD163 that don't have a match in macrophage_m2_data 
+unmatched_cases <- CD163 %>%
+  anti_join(macrophage_m2_data , by = c("Case_ID" = "Sample"))
+
+# View the unmatched cases
+print(unmatched_cases)
+
+# Find cases in macrophage_m2_data that are NOT in CD163
+unmatched_cases <- macrophage_m2_data %>%
+  anti_join(CD163, by = c("Sample" = "Case_ID"))
+
+# View the unmatched cases
+print(unmatched_cases$Sample)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# Ensure categorical variables are factors
+merged_data <- merged_data %>%
+  mutate(
+    hpv_status = factor(hpv_status)
+  )
+
+```
+
+
+
+
+
+
+
+#Differences between pdl1 positive and pdl1 negative tumors in CD163-positive cells
+```{r}
+
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(tidyr)
+
+# Define the parameters of interest
+cd163_params <- c(
+  "Positive_cells_tumor_stroma",
+  "Positive_cells_tumoral_area",
+  "Positive_cells_perivascular_areas"
+)
+
+# Filter and reshape data to long format
+plot_data <- merged_data %>%
+  filter(pdl1_immune_cells_pos_category %in% c("Positive", "Negative")) %>%
+  select(pdl1_immune_cells_pos_category, all_of(cd163_params)) %>%
+  pivot_longer(cols = -pdl1_immune_cells_pos_category, 
+               names_to = "CD163_Parameter", 
+               values_to = "Value")
+
+# Plot with facets
+combined_plot <- ggplot(plot_data, aes(x = pdl1_immune_cells_pos_category, y = Value, fill = pdl1_immune_cells_pos_category)) +
+  geom_boxplot(width = 0.4, outlier.shape = NA, position = position_dodge(0.9)) +
+  geom_jitter(aes(color = pdl1_immune_cells_pos_category),
+              position = position_jitter(width = 0.1),
+              size = 2, alpha = 0.6) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     label.x.npc = "center",
+                     label.y.npc = "top",
+                     size = 5) +
+  facet_wrap(~CD163_Parameter, scales = "free_y") +
+  scale_fill_manual(values = c("Negative" = "skyblue1", "Positive" = "skyblue4")) +
+  scale_color_manual(values = c("Negative" = "dodgerblue3", "Positive" = "darkblue")) +
+  theme_minimal() +
+  labs(
+    title = "CD163 Parameters by PD-L1 Immune Cell Status",
+    x = "PD-L1 Status",
+    y = "CD163-Positive Cell Count",
+    fill = "PD-L1 Status",
+    color = "PD-L1 Status"
+  ) +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+# Show plot
+print(combined_plot)
+
+# Save to file
+ggsave("CD163_by_PDL1_Status_combined_plot.pdf", plot = combined_plot, width = 10, height = 7)
+```
+
+
+
+#REVIEW
+```{r}
+# ============================================================================
+# CD163 IHC SURVIVAL ANALYSIS
+# DSS + RFS
+# maxstat + median + continuous
+# ============================================================================
+
+ihc_data <- merged_data %>%
+  mutate(
+    figo_ini_ava = relevel(
+      factor(figo_ini_ava),
+      ref = "1 (Advanced)"
+    ),
+    p53_ihc_status = relevel(
+      factor(p53_ihc_status),
+      ref = "Mutant"
+    ),
+    death_disease_60m = case_when(
+      as.character(death_disease_60m) %in% c("0", "No")  ~ 0,
+      as.character(death_disease_60m) %in% c("1", "Yes") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    recurrence_60m = case_when(
+      as.character(recurrence_60m) %in% c("0", "No")  ~ 0,
+      as.character(recurrence_60m) %in% c("1", "Yes") ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+# CD163 IHC markers / compartments
+compartments <- c(
+  "Positive_cells_tumoral_area",
+  "Positive_cells_tumor_stroma",
+  "Positive_cells_perivascular_areas"
+)
+
+# Covariates used in the CD163 multivariable models
+covariates_full <- c(
+  "figo_ini_ava",
+  "p53_ihc_status",
+  "pdl1_immune_cells_pos_category"
+)
+```
+
+
+
+```{r}
+# ============================================================================
+# SHARED HELPERS
+# ============================================================================
+
+check_convergence <- function(model, maxit_val) {
+  n_iter <- model$iter
+
+  !is.null(n_iter) &&
+    all(n_iter < maxit_val) &&
+    is.finite(sum(model$coefficients))
+}
+
+
+find_maxstat_cutoff_ihc <- function(time_var, event_var, marker_var, data) {
+
+  d <- data[
+    !is.na(data[[marker_var]]) &
+      !is.na(data[[time_var]]) &
+      !is.na(data[[event_var]]),
+  ]
+
+  n <- nrow(d)
+
+  if (n < 10) return(NA_real_)
+
+  fmla <- as.formula(
+    paste0(
+      "survival::Surv(",
+      time_var,
+      ", ",
+      event_var,
+      ") ~ ",
+      marker_var
+    )
+  )
+
+  MAXSTAT <- tryCatch(
+    maxstat::maxstat.test(
+      fmla,
+      data = d,
+      smethod = "LogRank",
+      pmethod = "Lau92",
+      iscores = TRUE,
+      minprop = 0.2,
+      maxprop = 0.8
+    ),
+    error = function(e) NA
+  )
+
+  if (isTRUE(is.na(MAXSTAT))) return(NA_real_)
+
+  MAXSTAT$estimate
+}
+
+
+add_threshold_groups_ihc <- function(
+    df,
+    time_var,
+    event_var,
+    marker_var
+) {
+
+  cutoff_maxstat <- tryCatch(
+    find_maxstat_cutoff_ihc(
+      time_var,
+      event_var,
+      marker_var,
+      df
+    ),
+    error = function(e) NA_real_
+  )
+
+  cutoff_median <- median(
+    df[[marker_var]],
+    na.rm = TRUE
+  )
+
+  df %>%
+    mutate(
+      Group_maxstat = ifelse(
+        !is.na(cutoff_maxstat) &
+          .data[[marker_var]] > cutoff_maxstat,
+        "High",
+        "Low"
+      ),
+
+      Group_median = ifelse(
+        .data[[marker_var]] > cutoff_median,
+        "High",
+        "Low"
+      )
+    )
+}
+
+
+make_cutoff_table_ihc <- function(data, markers, time_var, event_var) {
+  bind_rows(lapply(markers, function(m) {
+    d  <- data %>% filter(!is.na(.data[[m]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+    ev <- as.numeric(as.character(d[[event_var]]))
+    cuts <- c(maxstat = unname(find_maxstat_cutoff_ihc(time_var, event_var, m, d)),
+              median  = median(d[[m]], na.rm = TRUE))
+    bind_rows(lapply(names(cuts), function(tt) {
+      high <- !is.na(cuts[[tt]]) & d[[m]] > cuts[[tt]]
+      data.frame(marker = m, threshold_type = tt,
+                 cutoff = signif(cuts[[tt]], 3),
+                 `n (Low/High)`      = paste0(sum(!high), "/", sum(high)),
+                 `Events (Low/High)` = paste0(sum(ev[!high] == 1), "/", sum(ev[high] == 1)),
+                 check.names = FALSE)
+    }))
+  }))
+}
+
+add_cutoffs_ihc <- function(tab, cutoff_table) {
+  tab <- tab %>%
+    left_join(cutoff_table, by = c("marker", "threshold_type")) %>%
+    relocate(cutoff, `n (Low/High)`, `Events (Low/High)`, .after = threshold_type)
+  if ("Variable" %in% names(tab)) {
+    keep <- grepl("^Enrichment", tab$Variable)
+    tab[!keep, c("cutoff", "n (Low/High)", "Events (Low/High)")] <- NA
+  }
+  tab$converged <- ifelse(tab$converged, "Yes", "No")
+  tab
+}
+```
+
+
+
+
+```{r}
+# ============================================================================
+# DSS — UNIVARIATE
+# ============================================================================
+
+run_cox_DSS_ihc_group <- function(
+    marker_label,
+    marker_var,
+    exposure_var,
+    threshold_label,
+    data,
+    maxit_val = 100000
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_death_surv_60m",
+    "death_disease_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(df0[[exposure_var]]),
+    ref = "Low"
+  )
+
+  df0 <- df0 %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(death_disease_60m),
+      !is.na(time_death_surv_60m)
+    )
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      exposure_var
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        threshold_type = threshold_label,
+        coef = NA,
+        HR = NA,
+        lower_095 = NA,
+        upper_095 = NA,
+        pval = NA,
+        n = nrow(df0),
+        n_events = sum(
+          df0$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    threshold_type = threshold_label,
+    coef = s$coefficients,
+    HR = exp(s$coefficients),
+    lower_095 = s$ci.lower,
+    upper_095 = s$ci.upper,
+    pval = s$prob,
+    n = nrow(df0),
+    n_events = sum(
+      df0$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged
+  )
+}
+
+
+run_cox_DSS_ihc_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    maxit_val = 100000
+) {
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_var]]),
+      !is.na(death_disease_60m),
+      !is.na(time_death_surv_60m)
+    )
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      marker_var
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        threshold_type = "continuous",
+        coef = NA,
+        HR = NA,
+        lower_095 = NA,
+        upper_095 = NA,
+        pval = NA,
+        n = nrow(df0),
+        n_events = sum(
+          df0$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    threshold_type = "continuous",
+    coef = s$coefficients,
+    HR = exp(s$coefficients),
+    lower_095 = s$ci.lower,
+    upper_095 = s$ci.upper,
+    pval = s$prob,
+    n = nrow(df0),
+    n_events = sum(
+      df0$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged
+  )
+}
+
+
+univ_DSS_maxstat_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+      run_cox_DSS_ihc_group(
+        marker,
+        marker,
+        "Group_maxstat",
+        "maxstat",
+        ihc_data
+      )
+    }
+  )
+)
+
+
+univ_DSS_median_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+      run_cox_DSS_ihc_group(
+        marker,
+        marker,
+        "Group_median",
+        "median",
+        ihc_data
+      )
+    }
+  )
+)
+
+
+univ_DSS_continuous_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+      run_cox_DSS_ihc_continuous(
+        marker,
+        marker,
+        ihc_data
+      )
+    }
+  )
+)
+
+
+univ_DSS_ihc_all <- bind_rows(
+  univ_DSS_maxstat_ihc,
+  univ_DSS_median_ihc,
+  univ_DSS_continuous_ihc
+) %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = p.adjust(
+      pval,
+      method = "BH"
+    )
+  ) %>%
+  ungroup()
+
+
+univ_DSS_ihc_formatted <- univ_DSS_ihc_all %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      lower_095,
+      upper_095
+    ),
+    pval = round(pval, 4),
+    p_adj_BH = round(p_adj_BH, 4)
+  ) %>%
+  select(
+    marker,
+    threshold_type,
+    HR_CI,
+    pval,
+    p_adj_BH,
+    n,
+    n_events,
+    n_iter,
+    converged
+  ) %>%
+  arrange(
+    marker,
+    threshold_type
+  )
+
+cutoffs_DSS_cd163 <- make_cutoff_table_ihc(ihc_data, compartments,
+                                           "time_death_surv_60m", "death_disease_60m")
+cutoffs_DSS_cd163
+
+univ_DSS_ihc_formatted <- add_cutoffs_ihc(univ_DSS_ihc_formatted, cutoffs_DSS_cd163)
+kable(univ_DSS_ihc_formatted, caption = "Univariate Firth Cox regression for DSS: CD163 IHC")
+```
+
+
+```{r}
+# ============================================================================
+# DSS — SELECT MARKERS FOR MULTIVARIATE ANALYSIS
+# Select the UNION of markers with BH-adjusted p < 0.10
+# in ANY of the three univariate approaches
+# ============================================================================
+
+selected_DSS_ihc <- univ_DSS_ihc_all %>%
+  filter(
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.10
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+cat(
+  "CD163 markers entering DSS multivariable models:\n"
+)
+
+print(selected_DSS_ihc)
+```
+
+```{r}
+# ============================================================================
+# DSS — MULTIVARIATE MAXSTAT / MEDIAN
+# adjusted for FIGO + p53
+# ============================================================================
+
+perform_cox_DSS_ihc_multiv <- function(
+    marker_label,
+    marker_var,
+    exposure_var,
+    data,
+    covariates,
+    maxit_val = 100000
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_death_surv_60m",
+    "death_disease_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(df0[[exposure_var]]),
+    ref = "Low"
+  )
+
+  df0 <- df0 %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(death_disease_60m),
+      !is.na(time_death_surv_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      paste(
+        c(exposure_var, covariates),
+        collapse = " + "
+      )
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        variable = NA_character_,
+        coef = NA_real_,
+        HR = NA_real_,
+        lower_095 = NA_real_,
+        upper_095 = NA_real_,
+        pval = NA_real_,
+        n = nrow(df0),
+        n_events = sum(
+          df0$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients),
+    HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower),
+    upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0),
+    n_events = sum(
+      df0$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+multiv_DSS_maxstat_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(marker) {
+        perform_cox_DSS_ihc_multiv(
+          marker,
+          marker,
+          "Group_maxstat",
+          ihc_data,
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "maxstat",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+
+
+multiv_DSS_median_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(marker) {
+        perform_cox_DSS_ihc_multiv(
+          marker,
+          marker,
+          "Group_median",
+          ihc_data,
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "median",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+```
+
+
+
+
+
+
+```{r}
+# ============================================================================
+# DSS — MULTIVARIATE CONTINUOUS
+# ============================================================================
+
+perform_cox_DSS_ihc_multiv_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    covariates,
+    maxit_val = 100000
+) {
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_var]]),
+      !is.na(death_disease_60m),
+      !is.na(time_death_surv_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      marker_var,
+      " + ",
+      paste(
+        covariates,
+        collapse = " + "
+      )
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        variable = NA_character_,
+        coef = NA_real_,
+        HR = NA_real_,
+        lower_095 = NA_real_,
+        upper_095 = NA_real_,
+        pval = NA_real_,
+        n = nrow(df0),
+        n_events = sum(
+          df0$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(model$coefficients),
+    HR = exp(as.numeric(model$coefficients)),
+    lower_095 = as.numeric(model$ci.lower),
+    upper_095 = as.numeric(model$ci.upper),
+    pval = as.numeric(model$prob),
+    n = nrow(df0),
+    n_events = sum(
+      df0$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+multiv_DSS_continuous_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(marker) {
+        perform_cox_DSS_ihc_multiv_continuous(
+          marker,
+          marker,
+          ihc_data,
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "continuous",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+
+
+# BH correction for the marker term only
+if (nrow(multiv_DSS_continuous_ihc) > 0) {
+
+  multiv_DSS_continuous_ihc <- multiv_DSS_continuous_ihc %>%
+    mutate(
+      p_adj_BH = NA_real_
+    )
+
+  marker_rows <-
+    multiv_DSS_continuous_ihc$variable ==
+    multiv_DSS_continuous_ihc$marker
+
+  multiv_DSS_continuous_ihc$p_adj_BH[marker_rows] <-
+    p.adjust(
+      multiv_DSS_continuous_ihc$pval[marker_rows],
+      method = "BH"
+    )
+}
+```
+
+
+```{r}
+# ============================================================================
+# COMBINE DSS MULTIVARIATE RESULTS
+# ============================================================================
+
+multiv_DSS_ihc_all <- bind_rows(
+  multiv_DSS_maxstat_ihc,
+  multiv_DSS_median_ihc,
+  multiv_DSS_continuous_ihc
+)
+
+
+# BH correction separately within each threshold,
+# and only for the marker/exposure term
+multiv_DSS_ihc_all <- multiv_DSS_ihc_all %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = ifelse(
+      grepl("^Group_", variable) |
+        variable == marker,
+
+      p.adjust(
+        pval[
+          grepl("^Group_", variable) |
+            variable == marker
+        ],
+        method = "BH"
+      )[match(
+        pval,
+        pval[
+          grepl("^Group_", variable) |
+            variable == marker
+        ]
+      )],
+
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+
+format_table_DSS_ihc <- function(df) {
+
+  df %>%
+    mutate(
+      variable_label = case_when(
+        grepl("^Group_", variable) ~
+          "Enrichment (High vs Low)",
+
+        variable == marker ~
+          "Continuous (per unit)",
+
+        variable == "figo_ini_ava0 (Initial)" ~
+          "FIGO (Initial)",
+
+        variable == "p53_ihc_statusWt" ~
+          "p53 (Normal)",
+
+        TRUE ~ variable
+      ),
+
+      HR_CI = sprintf(
+        "%.4f (%.4f–%.4f)",
+        HR,
+        lower_095,
+        upper_095
+      ),
+
+      coef = round(coef, 4),
+      pval = round(pval, 4),
+      p_adj_BH = round(p_adj_BH, 4)
+    ) %>%
+    select(
+      marker,
+      threshold_type,
+      Variable = variable_label,
+      Coef = coef,
+      `HR (95% CI)` = HR_CI,
+      `p-value` = pval,
+      `p (BH-adj)` = p_adj_BH,
+      n,
+      n_events,
+      n_iter,
+      converged
+    )
+}
+
+
+multiv_DSS_ihc_formatted <-
+  format_table_DSS_ihc(
+    multiv_DSS_ihc_all
+  ) %>%
+  arrange(
+    marker,
+    threshold_type
+  )
+
+
+multiv_DSS_ihc_formatted <- add_cutoffs_ihc(multiv_DSS_ihc_formatted, cutoffs_DSS_cd163)
+
+kable(
+  multiv_DSS_ihc_formatted,
+  caption = "Multivariate Firth Cox regression for DSS: CD163 IHC"
+)
+```
+
+
+
+
+
+
+```{r}
+# ============================================================================
+# DSS — PROPORTIONAL HAZARDS ASSUMPTION
+# Schoenfeld residuals
+# ============================================================================
+
+check_ph_DSS_ihc <- function(
+    marker_label,
+    marker_var,
+    data,
+    exposure_var,
+    covariates
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_death_surv_60m",
+    "death_disease_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(df0[[exposure_var]]),
+    ref = "Low"
+  )
+
+  d <- df0 %>%
+    mutate(
+      death_disease_60m =
+        as.numeric(
+          as.character(death_disease_60m)
+        )
+    ) %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(time_death_surv_60m),
+      !is.na(death_disease_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      paste(
+        c(exposure_var, covariates),
+        collapse = " + "
+      )
+    )
+  )
+
+  fit <- tryCatch(
+    coxph(
+      fmla,
+      data = d
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "coxph_fit_failed"
+      )
+    )
+  }
+
+  zph <- tryCatch(
+    cox.zph(fit),
+    error = function(e) NULL
+  )
+
+  if (is.null(zph)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "zph_failed"
+      )
+    )
+  }
+
+  tab <- as.data.frame(
+    zph$table
+  )
+
+  tab$term <- rownames(tab)
+
+  global_p <- tab$p[
+    tab$term == "GLOBAL"
+  ]
+
+  data.frame(
+    marker = marker_label,
+    term = tab$term,
+    chisq = round(tab$chisq, 3),
+    df = tab$df,
+    p = round(tab$p, 4),
+    global_p = round(global_p, 4),
+    n = nrow(d),
+    n_events = sum(
+      d$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    note = NA_character_
+  )
+}
+
+
+ph_DSS_maxstat_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(m) {
+        check_ph_DSS_ihc(
+          m,
+          m,
+          ihc_data,
+          "Group_maxstat",
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "maxstat",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+
+
+ph_DSS_median_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(m) {
+        check_ph_DSS_ihc(
+          m,
+          m,
+          ihc_data,
+          "Group_median",
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "median",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+
+
+# Continuous PH function
+check_ph_DSS_ihc_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    covariates
+) {
+
+  d <- data %>%
+    filter(
+      !is.na(.data[[marker_var]]),
+      !is.na(time_death_surv_60m),
+      !is.na(death_disease_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    mutate(
+      death_disease_60m =
+        as.numeric(
+          as.character(death_disease_60m)
+        )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      marker_var,
+      " + ",
+      paste(
+        covariates,
+        collapse = " + "
+      )
+    )
+  )
+
+  fit <- tryCatch(
+    coxph(
+      fmla,
+      data = d
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "coxph_fit_failed"
+      )
+    )
+  }
+
+  zph <- tryCatch(
+    cox.zph(fit),
+    error = function(e) NULL
+  )
+
+  if (is.null(zph)) {
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$death_disease_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "zph_failed"
+      )
+    )
+  }
+
+  tab <- as.data.frame(
+    zph$table
+  )
+
+  tab$term <- rownames(tab)
+
+  global_p <- tab$p[
+    tab$term == "GLOBAL"
+  ]
+
+  data.frame(
+    marker = marker_label,
+    term = tab$term,
+    chisq = round(tab$chisq, 3),
+    df = tab$df,
+    p = round(tab$p, 4),
+    global_p = round(global_p, 4),
+    n = nrow(d),
+    n_events = sum(
+      d$death_disease_60m == 1,
+      na.rm = TRUE
+    ),
+    note = NA_character_
+  )
+}
+
+
+ph_DSS_continuous_ihc <- if (
+  length(selected_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_DSS_ihc,
+      function(m) {
+        check_ph_DSS_ihc_continuous(
+          m,
+          m,
+          ihc_data,
+          covariates_full
+        )
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "continuous",
+      .after = marker
+    )
+
+} else {
+  data.frame()
+}
+
+
+ph_DSS_ihc_all <- bind_rows(
+  ph_DSS_maxstat_ihc,
+  ph_DSS_median_ihc,
+  ph_DSS_continuous_ihc
+) %>%
+  arrange(
+    marker,
+    threshold_type,
+    term
+  )
+
+kable(
+  ph_DSS_ihc_all,
+  caption =
+    "Proportional hazards assumption for multivariable DSS models: CD163 IHC"
+)
+```
+
+```{r}
+
+# ============================================================================
+# DSS — SELECT MULTIVARIABLE MODELS FOR BOOTSTRAP
+# BH-adjusted p < 0.05
+# ============================================================================
+
+sig_maxstat_DSS_ihc <- multiv_DSS_ihc_all %>%
+  filter(
+    threshold_type == "maxstat",
+    grepl("^Group_maxstat", variable),
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+sig_median_DSS_ihc <- multiv_DSS_ihc_all %>%
+  filter(
+    threshold_type == "median",
+    grepl("^Group_median", variable),
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+sig_continuous_DSS_ihc <- multiv_DSS_ihc_all %>%
+  filter(
+    threshold_type == "continuous",
+    variable == marker,
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+cat("DSS maxstat models for bootstrap:\n")
+print(sig_maxstat_DSS_ihc)
+
+cat("\nDSS median models for bootstrap:\n")
+print(sig_median_DSS_ihc)
+
+cat("\nDSS continuous models for bootstrap:\n")
+print(sig_continuous_DSS_ihc)
+```
+
+
+```{r}
+# ============================================================================
+# DSS — BOOTSTRAP OPTIMISM CORRECTION
+# ============================================================================
+
+get_cutoff_DSS_ihc <- function(
+    threshold_type,
+    marker_var,
+    data
+) {
+
+  if (threshold_type == "maxstat") {
+
+    find_maxstat_cutoff_ihc(
+      "time_death_surv_60m",
+      "death_disease_60m",
+      marker_var,
+      data
+    )
+
+  } else {
+
+    median(
+      data[[marker_var]],
+      na.rm = TRUE
+    )
+  }
+}
+
+
+# ============================================================================
+# DSS — BOOTSTRAP OPTIMISM CORRECTION
+# ============================================================================
+
+bootstrap_DSS_ihc <- function(
+    marker_val,
+    threshold_type,
+    data,
+    covariates,
+    B = 1000,
+    maxit_boot = 500,
+    maxstep_boot = 0.5,
+    seed = 1
+) {
+
+  t0 <- Sys.time()
+
+  # --------------------------------------------------------------------------
+  # Original complete-case dataset
+  # --------------------------------------------------------------------------
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_val]]),
+      !is.na(time_death_surv_60m),
+      !is.na(death_disease_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+
+  # --------------------------------------------------------------------------
+  # Apparent cutoff
+  # --------------------------------------------------------------------------
+
+  cutoff0 <- if (
+    threshold_type == "continuous"
+  ) {
+
+    NA_real_
+
+  } else {
+
+    get_cutoff_DSS_ihc(
+      threshold_type,
+      marker_val,
+      df0
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Build exposure
+  # --------------------------------------------------------------------------
+
+  if (threshold_type != "continuous") {
+
+    if (is.na(cutoff0)) {
+
+      return(
+        data.frame(
+          marker = marker_val,
+          threshold_type = threshold_type,
+          HR_apparent = NA,
+          HR_corrected = NA,
+          HR_corrected_lower = NA,
+          HR_corrected_upper = NA,
+          optimism = NA,
+          B = B,
+          n_valid_boot = 0,
+          pct_valid = 0,
+          elapsed_sec = NA,
+          error = "cutoff_not_found"
+        )
+      )
+    }
+
+    df0$Group <- factor(
+      ifelse(
+        df0[[marker_val]] > cutoff0,
+        "High",
+        "Low"
+      ),
+      levels = c("Low", "High")
+    )
+
+    if (
+      nlevels(
+        droplevels(df0$Group)
+      ) < 2
+    ) {
+
+      return(
+        data.frame(
+          marker = marker_val,
+          threshold_type = threshold_type,
+          HR_apparent = NA,
+          HR_corrected = NA,
+          HR_corrected_lower = NA,
+          HR_corrected_upper = NA,
+          optimism = NA,
+          B = B,
+          n_valid_boot = 0,
+          pct_valid = 0,
+          elapsed_sec = NA,
+          error = "single_group"
+        )
+      )
+    }
+
+    # Variable used in formula
+    exposure_var <- "Group"
+
+    # IMPORTANT:
+    # coxphf() names the coefficient "GroupHigh"
+    coefficient_name <- "GroupHigh"
+
+  } else {
+
+    exposure_var <- marker_val
+
+    # Continuous variable has same name as coefficient
+    coefficient_name <- marker_val
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Formula
+  # --------------------------------------------------------------------------
+
+  fmla_boot <- as.formula(
+    paste0(
+      "Surv(time_death_surv_60m, death_disease_60m) ~ ",
+      exposure_var,
+      " + ",
+      paste(
+        covariates,
+        collapse = " + "
+      )
+    )
+  )
+
+
+  # --------------------------------------------------------------------------
+  # Apparent model
+  # --------------------------------------------------------------------------
+
+  fit_apparent <- tryCatch(
+    coxphf(
+      fmla_boot,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = 100000,
+      pl = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+
+  # --------------------------------------------------------------------------
+  # Check fitted model
+  # --------------------------------------------------------------------------
+
+  if (is.null(fit_apparent)) {
+
+    return(
+      data.frame(
+        marker = marker_val,
+        threshold_type = threshold_type,
+        HR_apparent = NA,
+        HR_corrected = NA,
+        HR_corrected_lower = NA,
+        HR_corrected_upper = NA,
+        optimism = NA,
+        B = B,
+        n_valid_boot = 0,
+        pct_valid = 0,
+        elapsed_sec = NA,
+        error = "apparent_fit_failed"
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Check coefficient
+  # --------------------------------------------------------------------------
+
+  if (
+    !(coefficient_name %in% names(fit_apparent$coefficients))
+  ) {
+
+    return(
+      data.frame(
+        marker = marker_val,
+        threshold_type = threshold_type,
+        HR_apparent = NA,
+        HR_corrected = NA,
+        HR_corrected_lower = NA,
+        HR_corrected_upper = NA,
+        optimism = NA,
+        B = B,
+        n_valid_boot = 0,
+        pct_valid = 0,
+        elapsed_sec = NA,
+        error = paste0(
+          "coefficient_not_found: ",
+          coefficient_name
+        )
+      )
+    )
+  }
+
+
+  beta_apparent <- unname(
+    fit_apparent$coefficients[
+      coefficient_name
+    ]
+  )
+
+
+  # --------------------------------------------------------------------------
+  # Bootstrap
+  # --------------------------------------------------------------------------
+
+  set.seed(seed)
+
+  n <- nrow(df0)
+
+  optimism_vec <- rep(
+    NA_real_,
+    B
+  )
+
+
+  for (b in seq_len(B)) {
+
+    idx <- sample(
+      seq_len(n),
+      n,
+      replace = TRUE
+    )
+
+    dboot <- df0[idx, ]
+
+
+    # ------------------------------------------------------------------------
+    # Recalculate cutoff in each bootstrap sample
+    # ------------------------------------------------------------------------
+
+    if (threshold_type != "continuous") {
+
+      cutoff_b <- get_cutoff_DSS_ihc(
+        threshold_type,
+        marker_val,
+        dboot
+      )
+
+      if (is.na(cutoff_b)) next
+
+
+      dboot$Group <- factor(
+        ifelse(
+          dboot[[marker_val]] > cutoff_b,
+          "High",
+          "Low"
+        ),
+        levels = c("Low", "High")
+      )
+
+
+      if (
+        nlevels(
+          droplevels(dboot$Group)
+        ) < 2
+      ) next
+      
+      ev_tab_boot <- table(dboot$Group, dboot$death_disease_60m)
+      if (ncol(ev_tab_boot) < 2 || any(ev_tab_boot[, 2] == 0)) next
+    }
+
+
+    # ------------------------------------------------------------------------
+    # Fit bootstrap model
+    # ------------------------------------------------------------------------
+
+    fit_boot <- tryCatch(
+      coxphf(
+        fmla_boot,
+        data = dboot,
+        maxstep = maxstep_boot,
+        maxit = maxit_boot,
+        pl = FALSE
+      ),
+      error = function(e) NULL
+    )
+
+
+    if (is.null(fit_boot)) next
+
+
+    if (
+      !(coefficient_name %in% names(fit_boot$coefficients))
+    ) next
+
+
+    beta_boot_apparent <- unname(
+      fit_boot$coefficients[
+        coefficient_name
+      ]
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Test bootstrap model on original data
+    # ------------------------------------------------------------------------
+
+    if (threshold_type != "continuous") {
+
+      df_test <- df0
+
+      # IMPORTANT:
+      # Use the bootstrap-derived cutoff on the original data
+      df_test$Group <- factor(
+        ifelse(
+          df_test[[marker_val]] > cutoff_b,
+          "High",
+          "Low"
+        ),
+        levels = c("Low", "High")
+      )
+
+      if (
+        nlevels(
+          droplevels(df_test$Group)
+        ) < 2
+      ) next      
+      
+      ev_tab_test <- table(df_test$Group, df_test$death_disease_60m)
+      if (ncol(ev_tab_test) < 2 || any(ev_tab_test[, 2] == 0)) next
+
+
+    } else {
+
+      df_test <- df0
+
+    }
+
+
+    fit_test <- tryCatch(
+      coxphf(
+        fmla_boot,
+        data = df_test,
+        maxstep = maxstep_boot,
+        maxit = maxit_boot,
+        pl = FALSE
+      ),
+      error = function(e) NULL
+    )
+
+
+    if (is.null(fit_test)) next
+
+
+    if (
+      !(coefficient_name %in% names(fit_test$coefficients))
+    ) next
+
+
+    beta_boot_test <- unname(
+      fit_test$coefficients[
+        coefficient_name
+      ]
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Optimism
+    # ------------------------------------------------------------------------
+
+    optimism_vec[b] <-
+      beta_boot_apparent -
+      beta_boot_test
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Valid bootstrap samples
+  # --------------------------------------------------------------------------
+
+  valid_optimism <-
+    optimism_vec[
+      !is.na(optimism_vec)
+    ]
+
+  n_valid <-
+    length(valid_optimism)
+
+  elapsed <-
+    as.numeric(
+      difftime(
+        Sys.time(),
+        t0,
+        units = "secs"
+      )
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Require sufficient valid bootstrap samples
+  # --------------------------------------------------------------------------
+
+  if (
+    n_valid < max(
+      10,
+      0.2 * B
+    )
+  ) {
+
+    return(
+      data.frame(
+        marker = marker_val,
+        threshold_type = threshold_type,
+        HR_apparent = exp(beta_apparent),
+        HR_corrected = NA,
+        HR_corrected_lower = NA,
+        HR_corrected_upper = NA,
+        optimism = NA,
+        B = B,
+        n_valid_boot = n_valid,
+        pct_valid = round(
+          100 * n_valid / B,
+          1
+        ),
+        elapsed_sec = round(
+          elapsed,
+          1
+        ),
+        error = "too_few_valid_bootstraps"
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Mean optimism
+  # --------------------------------------------------------------------------
+
+  mean_optimism <-
+    mean(
+      valid_optimism
+    )
+
+
+  beta_corrected <-
+    beta_apparent -
+    mean_optimism
+
+
+  corrected_dist <-
+    beta_apparent -
+    valid_optimism
+
+
+  ci <-
+    quantile(
+      corrected_dist,
+      probs = c(
+        0.025,
+        0.975
+      ),
+      na.rm = TRUE
+    )
+
+
+  # --------------------------------------------------------------------------
+  # Final result
+  # --------------------------------------------------------------------------
+
+  data.frame(
+    marker = marker_val,
+    threshold_type = threshold_type,
+    HR_apparent = exp(beta_apparent),
+    HR_corrected = exp(beta_corrected),
+    HR_corrected_lower = exp(ci[1]),
+    HR_corrected_upper = exp(ci[2]),
+    optimism = mean_optimism,
+    B = B,
+    n_valid_boot = n_valid,
+    pct_valid = round(
+      100 * n_valid / B,
+      1
+    ),
+    elapsed_sec = round(
+      elapsed,
+      1
+    ),
+    error = NA_character_
+  )
+}
+```
+
+
+```{r}
+test_median <- bootstrap_DSS_ihc(
+  marker_val = "Positive_cells_tumoral_area",
+  threshold_type = "median",
+  data = ihc_data,
+  covariates = covariates_full,
+  B = 20,
+  seed = 123
+)
+
+test_median
+```
+
+
+
+```{r}
+test_maxstat <- bootstrap_DSS_ihc(
+  marker_val = "Positive_cells_tumoral_area",
+  threshold_type = "maxstat",
+  data = ihc_data,
+  covariates = covariates_full,
+  B = 20,
+  seed = 123
+)
+
+test_maxstat
+```
+```{r}
+test_maxstat_tumoral_area <- bootstrap_DSS_ihc(
+  marker_val = "Positive_cells_tumoral_area",
+  threshold_type = "maxstat",
+  data = ihc_data,
+  covariates = covariates_full,
+  B = 20,
+  seed = 123
+)
+
+test_maxstat_tumoral_area
+```
+
+```{r}
+boot_DSS_ihc_maxstat <- if (
+  length(sig_maxstat_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      sig_maxstat_DSS_ihc,
+      bootstrap_DSS_ihc,
+      threshold_type = "maxstat",
+      data = ihc_data,
+      covariates = covariates_full,
+      B = 1000
+    )
+  )
+
+} else {
+  data.frame()
+}
+
+
+boot_DSS_ihc_median <- if (
+  length(sig_median_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      sig_median_DSS_ihc,
+      bootstrap_DSS_ihc,
+      threshold_type = "median",
+      data = ihc_data,
+      covariates = covariates_full,
+      B = 1000
+    )
+  )
+
+} else {
+  data.frame()
+}
+
+
+boot_DSS_ihc_continuous <- if (
+  length(sig_continuous_DSS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      sig_continuous_DSS_ihc,
+      bootstrap_DSS_ihc,
+      threshold_type = "continuous",
+      data = ihc_data,
+      covariates = covariates_full,
+      B = 1000
+    )
+  )
+
+} else {
+  data.frame()
+}
+
+
+boot_DSS_ihc_all <- bind_rows(
+  boot_DSS_ihc_maxstat,
+  boot_DSS_ihc_median,
+  boot_DSS_ihc_continuous
+) %>%
+  arrange(
+    marker,
+    threshold_type
+  )
+
+boot_DSS_ihc_all
+```
+
+
+
+#Visualization
+```{r}
+
+build_marker_order <- function(markers) {
+  markers <- unique(markers)
+  is_score <- grepl("score", markers, ignore.case = TRUE)
+  ordered <- c(sort(markers[is_score]), sort(markers[!is_score]))
+  rev(ordered)
+}
+```
+
+
+```{r}
+# ============================================================================
+# FOREST PLOT -- DSS (CD163 IHC), maxstat vs. median, bootstrap-corrected HRs
+# ============================================================================
+
+library(ggplot2)
+
+make_optimism_forest_ihc <- function(boot_df, multiv_df, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(marker, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- boot_df %>%
+    filter(!is.na(HR_corrected), threshold_type %in% c("maxstat", "median")) %>%
+    left_join(sig_df, by = c("marker", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    )
+
+  marker_order <- build_marker_order(df$marker)
+  df <- df %>% mutate(marker = factor(marker, levels = marker_order))
+
+  ggplot(df, aes(x = marker, y = HR_corrected, color = threshold_type,
+                  shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = HR_corrected_lower, ymax = HR_corrected_upper),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"),
+                        name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."),
+                        name = "Significance\n(apparent model)") +
+    labs(title = title, x = "", y = "Bootstrap-corrected Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DSS_ihc_corrected <- make_optimism_forest_ihc(
+  boot_DSS_ihc_all, multiv_DSS_ihc_formatted,
+  "DSS \u2014 CD163 IHC, bootstrap-corrected HRs, maxstat vs. median"
+)
+forest_DSS_ihc_corrected
+```
+
+```{r}
+# ============================================================================
+# FOREST PLOT -- DSS (CD163 IHC), maxstat vs. median, NON-BOOTSTRAP HRs
+# ============================================================================
+
+make_forest_ihc <- function(multiv_df, multiv_raw, title) {
+
+  sig_df <- multiv_df %>%
+    filter(Variable == "Enrichment (High vs Low)") %>%
+    transmute(marker, threshold_type,
+              significant = !is.na(`p (BH-adj)`) & `p (BH-adj)` < 0.05)
+
+  df <- multiv_raw %>%
+    filter(variable %in% c("Group_maxstatHigh", "Group_medianHigh")) %>%
+    left_join(sig_df, by = c("marker", "threshold_type")) %>%
+    mutate(
+      significant = ifelse(is.na(significant), FALSE, significant),
+      threshold_type = factor(threshold_type, levels = c("maxstat", "median"),
+                               labels = c("Maxstat", "Median"))
+    ) %>%
+    filter(!is.na(HR), !is.na(lower_095), !is.na(upper_095))
+
+  marker_order <- build_marker_order(df$marker)
+  df <- df %>% mutate(marker = factor(marker, levels = marker_order))
+
+  ggplot(df, aes(x = marker, y = HR, color = threshold_type, shape = significant)) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbar(aes(ymin = lower_095, ymax = upper_095),
+                  position = position_dodge(width = 0.5), width = 0.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+    coord_flip() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Maxstat" = "#D55E00", "Median" = "#0072B2"), name = "Threshold") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                        labels = c("TRUE" = "p.adj < 0.05", "FALSE" = "n.s."), name = "Significance") +
+    labs(title = title, x = "", y = "Hazard Ratio (log scale)") +
+    theme_minimal()
+}
+
+forest_DSS_ihc_unadjusted <- make_forest_ihc(
+  multiv_df  = multiv_DSS_ihc_formatted,
+  multiv_raw = multiv_DSS_ihc_all,
+  title = "DSS \u2014 CD163 IHC, multivariable HRs, maxstat vs. median"
+)
+
+forest_DSS_ihc_unadjusted
+```
+
+
+
+```{r}
+# ============================================================================
+# KAPLAN-MEIER -- DSS by CD163 enrichment (maxstat and median)
+# ============================================================================
+
+plot_km_ihc <- function(data, marker_var, time_var, event_var, group_var, title) {
+
+  df0 <- add_threshold_groups_ihc(data, time_var, event_var, marker_var)
+  df0[[event_var]] <- as.numeric(as.character(df0[[event_var]]))
+  df0[[group_var]] <- droplevels(factor(df0[[group_var]], levels = c("Low", "High")))
+  df0 <- df0 %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[time_var]]), !is.na(.data[[event_var]]))
+
+  grp_counts <- table(df0[[group_var]])
+  if (any(grp_counts == 0) || length(grp_counts) < 2) {
+    stop(sprintf(
+      "Cannot build KM plot for '%s' / %s: group counts are %s.",
+      marker_var, group_var, paste(names(grp_counts), grp_counts, sep = "=", collapse = ", ")
+    ))
+  }
+
+  fmla <- as.formula(paste0("Surv(", time_var, ", ", event_var, ") ~ ", group_var))
+  fit <- survminer::surv_fit(fmla, data = df0)
+
+  ggsurvplot(
+    fit, data = df0, pval = TRUE, risk.table = TRUE,
+    legend.title = paste(marker_var, "enrichment"), legend.labs = c("Low", "High"),
+    title = title, palette = c("gray50", "black"),
+    xlab = "Time (months)", ylab = "Survival probability"
+  )
+}
+
+km_dss_ihc_maxstat <- lapply(sig_maxstat_DSS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_death_surv_60m", "death_disease_60m", "Group_maxstat",
+              paste0("DSS by ", m, " enrichment (maxstat)"))
+})
+
+km_dss_ihc_median <- lapply(sig_median_DSS_ihc, function(m) {
+  plot_km_ihc(ihc_data, m, "time_death_surv_60m", "death_disease_60m", "Group_median",
+              paste0("DSS by ", m, " enrichment (median)"))
+})
+
+km_dss_ihc_maxstat
+km_dss_ihc_median
+```
+
+
+
+
+
+
+
+
+
+#Recurrence
+```{r}
+# ============================================================================
+# RFS — CD163 IHC SURVIVAL ANALYSIS
+# maxstat + median + continuous
+# univariate -> multivariate -> PH test -> bootstrap
+# ============================================================================
+
+
+# ============================================================================
+# 1. RFS — UNIVARIATE
+# ============================================================================
+
+run_cox_RFS_ihc_group <- function(
+    marker_label,
+    marker_var,
+    exposure_var,
+    threshold_label,
+    data,
+    maxit_val = 100000
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_recurrence_surv_60m",
+    "recurrence_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(df0[[exposure_var]]),
+    ref = "Low"
+  )
+
+  df0 <- df0 %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(recurrence_60m),
+      !is.na(time_recurrence_surv_60m)
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      exposure_var
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        threshold_type = threshold_label,
+        coef = NA,
+        HR = NA,
+        lower_095 = NA,
+        upper_095 = NA,
+        pval = NA,
+        n = nrow(df0),
+        n_events = sum(
+          df0$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    threshold_type = threshold_label,
+    coef = s$coefficients,
+    HR = exp(s$coefficients),
+    lower_095 = s$ci.lower,
+    upper_095 = s$ci.upper,
+    pval = s$prob,
+    n = nrow(df0),
+    n_events = sum(
+      df0$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# RFS — UNIVARIATE CONTINUOUS
+# ----------------------------------------------------------------------------
+
+run_cox_RFS_ihc_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    maxit_val = 100000
+) {
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_var]]),
+      !is.na(recurrence_60m),
+      !is.na(time_recurrence_surv_60m)
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      marker_var
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        threshold_type = "continuous",
+        coef = NA,
+        HR = NA,
+        lower_095 = NA,
+        upper_095 = NA,
+        pval = NA,
+        n = nrow(df0),
+        n_events = sum(
+          df0$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    threshold_type = "continuous",
+    coef = s$coefficients,
+    HR = exp(s$coefficients),
+    lower_095 = s$ci.lower,
+    upper_095 = s$ci.upper,
+    pval = s$prob,
+    n = nrow(df0),
+    n_events = sum(
+      df0$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# Run all three RFS univariate analyses
+# ----------------------------------------------------------------------------
+
+univ_RFS_maxstat_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+
+      run_cox_RFS_ihc_group(
+        marker,
+        marker,
+        "Group_maxstat",
+        "maxstat",
+        ihc_data
+      )
+
+    }
+  )
+)
+
+
+univ_RFS_median_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+
+      run_cox_RFS_ihc_group(
+        marker,
+        marker,
+        "Group_median",
+        "median",
+        ihc_data
+      )
+
+    }
+  )
+)
+
+
+univ_RFS_continuous_ihc <- bind_rows(
+  lapply(
+    compartments,
+    function(marker) {
+
+      run_cox_RFS_ihc_continuous(
+        marker,
+        marker,
+        ihc_data
+      )
+
+    }
+  )
+)
+
+
+# ----------------------------------------------------------------------------
+# Combine RFS univariate results
+# BH correction separately within each threshold
+# ----------------------------------------------------------------------------
+
+univ_RFS_ihc_all <- bind_rows(
+  univ_RFS_maxstat_ihc,
+  univ_RFS_median_ihc,
+  univ_RFS_continuous_ihc
+) %>%
+  group_by(threshold_type) %>%
+  mutate(
+    p_adj_BH = p.adjust(
+      pval,
+      method = "BH"
+    )
+  ) %>%
+  ungroup()
+
+
+# ----------------------------------------------------------------------------
+# Format table
+# ----------------------------------------------------------------------------
+
+univ_RFS_ihc_formatted <- univ_RFS_ihc_all %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      lower_095,
+      upper_095
+    ),
+    pval = round(
+      pval,
+      4
+    ),
+    p_adj_BH = round(
+      p_adj_BH,
+      4
+    )
+  ) %>%
+  select(
+    marker,
+    threshold_type,
+    HR_CI,
+    pval,
+    p_adj_BH,
+    n,
+    n_events,
+    n_iter,
+    converged
+  ) %>%
+  arrange(
+    marker,
+    threshold_type
+  )
+
+
+
+
+cutoffs_RFS_cd163 <- make_cutoff_table_ihc(ihc_data, compartments,
+                                           "time_recurrence_surv_60m", "recurrence_60m")
+univ_RFS_ihc_formatted <- add_cutoffs_ihc(univ_RFS_ihc_formatted, cutoffs_RFS_cd163)
+kable(univ_RFS_ihc_formatted, caption = "Univariate Firth Cox regression for RFS: CD163 IHC")
+
+```
+
+
+
+```{r}
+# ============================================================================
+# RFS — SELECT MARKERS FOR MULTIVARIATE
+# UNION OF MARKERS WITH p(BH) < 0.10
+# ============================================================================
+
+selected_RFS_ihc <- univ_RFS_ihc_all %>%
+  filter(
+    p_adj_BH < 0.10
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+cat(
+  "CD163 markers entering ALL RFS multivariable models:\n"
+)
+
+print(selected_RFS_ihc)
+```
+
+```{r}
+# ============================================================================
+# RFS — MULTIVARIATE MAXSTAT / MEDIAN
+# adjusted for FIGO + p53
+# ============================================================================
+
+perform_cox_RFS_ihc_multiv <- function(
+    marker_label,
+    marker_var,
+    exposure_var,
+    data,
+    covariates,
+    maxit_val = 100000
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_recurrence_surv_60m",
+    "recurrence_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(df0[[exposure_var]]),
+    ref = "Low"
+  )
+
+  df0 <- df0 %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(recurrence_60m),
+      !is.na(time_recurrence_surv_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      paste(
+        c(
+          exposure_var,
+          covariates
+        ),
+        collapse = " + "
+      )
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        variable = NA_character_,
+        coef = NA_real_,
+        HR = NA_real_,
+        lower_095 = NA_real_,
+        upper_095 = NA_real_,
+        pval = NA_real_,
+        n = nrow(df0),
+        n_events = sum(
+          df0$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(
+      model$coefficients
+    ),
+    HR = exp(
+      as.numeric(
+        model$coefficients
+      )
+    ),
+    lower_095 = as.numeric(
+      model$ci.lower
+    ),
+    upper_095 = as.numeric(
+      model$ci.upper
+    ),
+    pval = as.numeric(
+      model$prob
+    ),
+    n = nrow(df0),
+    n_events = sum(
+      df0$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# MAXSTAT
+# ----------------------------------------------------------------------------
+
+multiv_RFS_maxstat_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(marker) {
+
+        perform_cox_RFS_ihc_multiv(
+          marker,
+          marker,
+          "Group_maxstat",
+          ihc_data,
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "maxstat",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+
+
+# ----------------------------------------------------------------------------
+# MEDIAN
+# ----------------------------------------------------------------------------
+
+multiv_RFS_median_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(marker) {
+
+        perform_cox_RFS_ihc_multiv(
+          marker,
+          marker,
+          "Group_median",
+          ihc_data,
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "median",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+```
+
+
+```{r}
+# ============================================================================
+# RFS — MULTIVARIATE CONTINUOUS
+# ============================================================================
+
+perform_cox_RFS_ihc_multiv_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    covariates,
+    maxit_val = 100000
+) {
+
+  df0 <- data %>%
+    filter(
+      !is.na(.data[[marker_var]]),
+      !is.na(recurrence_60m),
+      !is.na(time_recurrence_surv_60m),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      marker_var,
+      " + ",
+      paste(
+        covariates,
+        collapse = " + "
+      )
+    )
+  )
+
+  model <- tryCatch(
+    coxphf(
+      fmla,
+      data = df0,
+      maxstep = 0.0001,
+      maxit = maxit_val
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        variable = NA_character_,
+        coef = NA_real_,
+        HR = NA_real_,
+        lower_095 = NA_real_,
+        upper_095 = NA_real_,
+        pval = NA_real_,
+        n = nrow(df0),
+        n_events = sum(
+          df0$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        n_iter = NA,
+        converged = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  s <- summary(model)
+
+  converged <- check_convergence(
+    model,
+    maxit_val
+  )
+
+  data.frame(
+    marker = marker_label,
+    variable = names(model$coefficients),
+    coef = as.numeric(
+      model$coefficients
+    ),
+    HR = exp(
+      as.numeric(
+        model$coefficients
+      )
+    ),
+    lower_095 = as.numeric(
+      model$ci.lower
+    ),
+    upper_095 = as.numeric(
+      model$ci.upper
+    ),
+    pval = as.numeric(
+      model$prob
+    ),
+    n = nrow(df0),
+    n_events = sum(
+      df0$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    n_iter = paste(
+      model$iter,
+      collapse = ","
+    ),
+    converged = converged,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+multiv_RFS_continuous_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(marker) {
+
+        perform_cox_RFS_ihc_multiv_continuous(
+          marker,
+          marker,
+          ihc_data,
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "continuous",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+
+
+# ----------------------------------------------------------------------------
+# BH correction for continuous marker terms
+# ----------------------------------------------------------------------------
+
+if (
+  nrow(multiv_RFS_continuous_ihc) > 0
+) {
+
+  multiv_RFS_continuous_ihc <-
+    multiv_RFS_continuous_ihc %>%
+    mutate(
+      p_adj_BH = NA_real_
+    )
+
+  marker_rows <-
+    multiv_RFS_continuous_ihc$variable ==
+    multiv_RFS_continuous_ihc$marker
+
+  multiv_RFS_continuous_ihc$p_adj_BH[
+    marker_rows
+  ] <-
+    p.adjust(
+      multiv_RFS_continuous_ihc$pval[
+        marker_rows
+      ],
+      method = "BH"
+    )
+}
+```
+
+```{r}
+# ============================================================================
+# COMBINE RFS MULTIVARIATE RESULTS
+# ============================================================================
+
+multiv_RFS_ihc_all <- bind_rows(
+  multiv_RFS_maxstat_ihc,
+  multiv_RFS_median_ihc,
+  multiv_RFS_continuous_ihc
+)
+
+
+# ----------------------------------------------------------------------------
+# BH correction separately within threshold type
+# ----------------------------------------------------------------------------
+
+multiv_RFS_ihc_all <-
+  multiv_RFS_ihc_all %>%
+  group_by(
+    threshold_type
+  ) %>%
+  mutate(
+    marker_test =
+      grepl(
+        "^Group_",
+        variable
+      ) |
+      variable == marker,
+
+    p_adj_BH =
+      ifelse(
+        marker_test,
+
+        p.adjust(
+          pval[
+            marker_test
+          ],
+          method = "BH"
+        )[match(
+          pval,
+          pval[
+            marker_test
+          ]
+        )],
+
+        NA_real_
+      )
+  ) %>%
+  ungroup()
+
+
+# ----------------------------------------------------------------------------
+# Format table
+# ----------------------------------------------------------------------------
+
+format_table_RFS_ihc <- function(df) {
+
+  df %>%
+    mutate(
+
+      variable_label = case_when(
+
+        grepl(
+          "^Group_maxstat",
+          variable
+        ) ~
+          "Enrichment (High vs Low)",
+
+        grepl(
+          "^Group_median",
+          variable
+        ) ~
+          "Enrichment (High vs Low)",
+
+        variable == marker ~
+          "Continuous (per unit)",
+
+        variable ==
+          "figo_ini_ava0 (Initial)" ~
+          "FIGO (Initial)",
+
+        variable ==
+          "p53_ihc_statusWt" ~
+          "p53 (Normal)",
+
+        TRUE ~
+          variable
+      ),
+
+      HR_CI = sprintf(
+        "%.4f (%.4f–%.4f)",
+        HR,
+        lower_095,
+        upper_095
+      ),
+
+      coef = round(
+        coef,
+        4
+      ),
+
+      pval = round(
+        pval,
+        4
+      ),
+
+      p_adj_BH = round(
+        p_adj_BH,
+        4
+      )
+    ) %>%
+    select(
+      marker,
+      threshold_type,
+      Variable = variable_label,
+      Coef = coef,
+      `HR (95% CI)` = HR_CI,
+      `p-value` = pval,
+      `p (BH-adj)` = p_adj_BH,
+      n,
+      n_events,
+      n_iter,
+      converged
+    )
+}
+
+
+multiv_RFS_ihc_formatted <-
+  format_table_RFS_ihc(
+    multiv_RFS_ihc_all
+  ) %>%
+  arrange(
+    marker,
+    threshold_type
+  )
+
+
+multiv_RFS_ihc_formatted <- add_cutoffs_ihc(multiv_RFS_ihc_formatted, cutoffs_RFS_cd163)
+
+
+kable(
+  multiv_RFS_ihc_formatted,
+  caption =
+    "Multivariate Firth Cox regression for RFS: CD163 IHC"
+)
+```
+
+
+```{r}
+# ============================================================================
+# RFS — PROPORTIONAL HAZARDS ASSUMPTION
+# Schoenfeld residuals
+# ============================================================================
+
+check_ph_RFS_ihc <- function(
+    marker_label,
+    marker_var,
+    data,
+    exposure_var,
+    covariates
+) {
+
+  df0 <- add_threshold_groups_ihc(
+    data,
+    "time_recurrence_surv_60m",
+    "recurrence_60m",
+    marker_var
+  )
+
+  df0[[exposure_var]] <- relevel(
+    factor(
+      df0[[exposure_var]]
+    ),
+    ref = "Low"
+  )
+
+  d <- df0 %>%
+    mutate(
+      recurrence_60m =
+        as.numeric(
+          as.character(
+            recurrence_60m
+          )
+        )
+    ) %>%
+    filter(
+      !is.na(.data[[exposure_var]]),
+      !is.na(
+        time_recurrence_surv_60m
+      ),
+      !is.na(
+        recurrence_60m
+      ),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      paste(
+        c(
+          exposure_var,
+          covariates
+        ),
+        collapse = " + "
+      )
+    )
+  )
+
+  fit <- tryCatch(
+    coxph(
+      fmla,
+      data = d
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "coxph_fit_failed"
+      )
+    )
+  }
+
+  zph <- tryCatch(
+    cox.zph(fit),
+    error = function(e) NULL
+  )
+
+  if (is.null(zph)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "zph_failed"
+      )
+    )
+  }
+
+  tab <- as.data.frame(
+    zph$table
+  )
+
+  tab$term <- rownames(
+    zph$table
+  )
+
+  global_p <-
+    tab$p[
+      tab$term == "GLOBAL"
+    ]
+
+  data.frame(
+    marker = marker_label,
+    term = tab$term,
+    chisq = round(
+      tab$chisq,
+      3
+    ),
+    df = tab$df,
+    p = round(
+      tab$p,
+      4
+    ),
+    global_p = round(
+      global_p,
+      4
+    ),
+    n = nrow(d),
+    n_events = sum(
+      d$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    note = NA_character_
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# PH — MAXSTAT
+# ----------------------------------------------------------------------------
+
+ph_RFS_maxstat_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(m) {
+
+        check_ph_RFS_ihc(
+          m,
+          m,
+          ihc_data,
+          "Group_maxstat",
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "maxstat",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+
+
+# ----------------------------------------------------------------------------
+# PH — MEDIAN
+# ----------------------------------------------------------------------------
+
+ph_RFS_median_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(m) {
+
+        check_ph_RFS_ihc(
+          m,
+          m,
+          ihc_data,
+          "Group_median",
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "median",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+```
+
+
+
+```{r}
+# ============================================================================
+# RFS — PH TEST FOR CONTINUOUS MODELS
+# ============================================================================
+
+check_ph_RFS_ihc_continuous <- function(
+    marker_label,
+    marker_var,
+    data,
+    covariates
+) {
+
+  d <- data %>%
+    filter(
+      !is.na(
+        .data[[marker_var]]
+      ),
+      !is.na(
+        time_recurrence_surv_60m
+      ),
+      !is.na(
+        recurrence_60m
+      ),
+      if_all(
+        all_of(covariates),
+        ~ !is.na(.)
+      )
+    ) %>%
+    mutate(
+      recurrence_60m =
+        as.numeric(
+          as.character(
+            recurrence_60m
+          )
+        )
+    ) %>%
+    droplevels()
+
+  fmla <- as.formula(
+    paste0(
+      "Surv(time_recurrence_surv_60m, recurrence_60m) ~ ",
+      marker_var,
+      " + ",
+      paste(
+        covariates,
+        collapse = " + "
+      )
+    )
+  )
+
+  fit <- tryCatch(
+    coxph(
+      fmla,
+      data = d
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "coxph_fit_failed"
+      )
+    )
+  }
+
+  zph <- tryCatch(
+    cox.zph(fit),
+    error = function(e) NULL
+  )
+
+  if (is.null(zph)) {
+
+    return(
+      data.frame(
+        marker = marker_label,
+        term = NA,
+        chisq = NA,
+        df = NA,
+        p = NA,
+        global_p = NA,
+        n = nrow(d),
+        n_events = sum(
+          d$recurrence_60m == 1,
+          na.rm = TRUE
+        ),
+        note = "zph_failed"
+      )
+    )
+  }
+
+  tab <- as.data.frame(
+    zph$table
+  )
+
+  tab$term <- rownames(
+    zph$table
+  )
+
+  global_p <-
+    tab$p[
+      tab$term == "GLOBAL"
+    ]
+
+  data.frame(
+    marker = marker_label,
+    term = tab$term,
+    chisq = round(
+      tab$chisq,
+      3
+    ),
+    df = tab$df,
+    p = round(
+      tab$p,
+      4
+    ),
+    global_p = round(
+      global_p,
+      4
+    ),
+    n = nrow(d),
+    n_events = sum(
+      d$recurrence_60m == 1,
+      na.rm = TRUE
+    ),
+    note = NA_character_
+  )
+}
+
+
+ph_RFS_continuous_ihc <- if (
+  length(selected_RFS_ihc) > 0
+) {
+
+  bind_rows(
+    lapply(
+      selected_RFS_ihc,
+      function(m) {
+
+        check_ph_RFS_ihc_continuous(
+          m,
+          m,
+          ihc_data,
+          covariates_full
+        )
+
+      }
+    )
+  ) %>%
+    mutate(
+      threshold_type = "continuous",
+      .after = marker
+    )
+
+} else {
+
+  data.frame()
+
+}
+
+
+# ----------------------------------------------------------------------------
+# Combine PH results
+# ----------------------------------------------------------------------------
+
+ph_RFS_ihc_all <- bind_rows(
+  ph_RFS_maxstat_ihc,
+  ph_RFS_median_ihc,
+  ph_RFS_continuous_ihc
+) %>%
+  arrange(
+    marker,
+    threshold_type,
+    term
+  )
+
+
+kable(
+  ph_RFS_ihc_all,
+  caption =
+    "Proportional hazards assumption for multivariable RFS models: CD163 IHC"
+)
+```
+
+
+```{r}
+# ============================================================================
+# RFS — SELECT MULTIVARIABLE MODELS FOR BOOTSTRAP
+# BH-adjusted p < 0.05
+# ============================================================================
+
+sig_maxstat_RFS_ihc <- multiv_RFS_ihc_all %>%
+  filter(
+    threshold_type == "maxstat",
+    grepl(
+      "^Group_maxstat",
+      variable
+    ),
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+sig_median_RFS_ihc <- multiv_RFS_ihc_all %>%
+  filter(
+    threshold_type == "median",
+    grepl(
+      "^Group_median",
+      variable
+    ),
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+sig_continuous_RFS_ihc <- multiv_RFS_ihc_all %>%
+  filter(
+    threshold_type == "continuous",
+    variable == marker,
+    !is.na(p_adj_BH),
+    p_adj_BH < 0.05
+  ) %>%
+  pull(marker) %>%
+  unique()
+
+
+cat(
+  "RFS maxstat models for bootstrap:\n"
+)
+
+print(
+  sig_maxstat_RFS_ihc
+)
+
+
+cat(
+  "\nRFS median models for bootstrap:\n"
+)
+
+print(
+  sig_median_RFS_ihc
+)
+
+
+cat(
+  "\nRFS continuous models for bootstrap:\n"
+)
+
+print(
+  sig_continuous_RFS_ihc
+)
+```
+#There are no padj<0.05 in multivariate models so i do not need to run bootsrap for these
+
+
+
+
+
+
+```{r}
+relabel <- function(df) df %>% mutate(marker = recode(marker,
+  "Positive_cells_tumoral_area"       = "Positive_cells_overall_tumoral_area",
+  "Positive_cells_tumor_stroma"       = "Positive_cells_tumor_associated_stroma",
+  "Positive_cells_perivascular_areas" = "Positive_cells_perivascular_areas"))
+
+tabs <- list(
+  Uni_recurrence_CD163   = relabel(univ_RFS_ihc_formatted),
+  Multi_recurrence_CD163 = relabel(multiv_RFS_ihc_formatted),
+  Uni_death_CD163        = relabel(univ_DSS_ihc_formatted),
+  Multi_death_CD163      = relabel(multiv_DSS_ihc_formatted)
+)
+wb <- createWorkbook()
+for (nm in names(tabs)) {
+  addWorksheet(wb, nm)
+  writeData(wb, nm, tabs[[nm]], headerStyle = createStyle(textDecoration = "bold"))
+  setColWidths(wb, nm, cols = 1:ncol(tabs[[nm]]), widths = "auto")
+}
+saveWorkbook(wb, "CD163_survival_with_cutoffs.xlsx", overwrite = TRUE)
+```
+
+
+
+
+```{r}
+   wb9 <- createWorkbook()
+   addWorksheet(wb9, "Bootstrap_CD163_death")
+   writeData(wb9, "Bootstrap_CD163_death", relabel(boot_DSS_ihc_all),
+             headerStyle = createStyle(textDecoration = "bold"))
+   addWorksheet(wb9, "Bootstrap_CD163_recurrence")
+   writeData(wb9, "Bootstrap_CD163_recurrence",
+             data.frame(Note = "No CD163 RFS multivariable model reached BH-adjusted p < 0.05; bootstrap not performed."))
+   saveWorkbook(wb9, "CD163_bootstrap.xlsx", overwrite = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#PD-L1 CD163 interaction analysis
+
+```{r}
+# ============================================================
+# 1. DEFINE CD163 HIGH/LOW USING THE MAXSTAT THRESHOLD
+#    (overall tumor area, DSS)
+# ============================================================
+
+# Find the optimal CD163 tumor-area cutoff using maxstat
+cd163_maxstat_cutoff <- find_maxstat_cutoff_ihc(
+  data = ihc_data,
+  marker_var = "Positive_cells_tumoral_area",
+  time_var = "time_death_surv_60m",
+  event_var = "death_disease_60m"
+)
+
+cd163_maxstat_cutoff
+
+
+# Create CD163 High/Low using the SAME maxstat cutoff
+# for ALL subsequent analyses
+
+ihc_data <- ihc_data %>%
+  mutate(
+    CD163_group = case_when(
+      is.na(Positive_cells_tumoral_area) ~ NA_character_,
+      Positive_cells_tumoral_area > cd163_maxstat_cutoff ~ "High",
+      Positive_cells_tumoral_area <= cd163_maxstat_cutoff ~ "Low"
+    ),
+
+    CD163_group = factor(
+      CD163_group,
+      levels = c("Low", "High")
+    ),
+
+    PDL1_group = factor(
+      pdl1_immune_cells_pos_category,
+      levels = c("Negative", "Positive")
+    )
+  )
+
+
+# Check distribution
+
+table(
+  ihc_data$CD163_group,
+  useNA = "ifany"
+)
+
+table(
+  ihc_data$PDL1_group,
+  useNA = "ifany"
+)
+
+
+# ============================================================
+# 2. CREATE THE FOUR COMBINED GROUPS
+# ============================================================
+
+ihc_data <- ihc_data %>%
+  mutate(
+    immuno_group = case_when(
+      PDL1_group == "Negative" & CD163_group == "Low" ~
+        "PD-L1- CD163 low",
+
+      PDL1_group == "Negative" & CD163_group == "High" ~
+        "PD-L1- CD163 high",
+
+      PDL1_group == "Positive" & CD163_group == "Low" ~
+        "PD-L1+ CD163 low",
+
+      PDL1_group == "Positive" & CD163_group == "High" ~
+        "PD-L1+ CD163 high",
+
+      TRUE ~ NA_character_
+    ),
+
+    immuno_group = factor(
+      immuno_group,
+      levels = c(
+        "PD-L1- CD163 low",
+        "PD-L1- CD163 high",
+        "PD-L1+ CD163 low",
+        "PD-L1+ CD163 high"
+      )
+    )
+  )
+
+
+# ============================================================
+# 3. CHECK NUMBERS IN THE FOUR GROUPS
+# ============================================================
+
+table(
+  ihc_data$immuno_group,
+  useNA = "ifany"
+)
+
+
+# Show the actual maxstat cutoff and group sizes
+cat(
+  "\nCD163 tumoral area maxstat cutoff:",
+  cd163_maxstat_cutoff,
+  "\n"
+)
+
+print(
+  table(
+    ihc_data$PDL1_group,
+    ihc_data$CD163_group,
+    useNA = "ifany"
+  )
+)
+```
+
+
+
+```{r}
+# ============================================================
+# ASSOCIATION BETWEEN PD-L1 STATUS AND CD163 GROUP
+# Fisher's exact test + concordance
+# ============================================================
+
+tab_pdl1_cd163 <- table(
+  PDL1  = ihc_data$PDL1_group,
+  CD163 = ihc_data$CD163_group
+)
+
+tab_pdl1_cd163
+
+fisher_pdl1_cd163 <- fisher.test(tab_pdl1_cd163)
+fisher_pdl1_cd163
+
+# CD163-high proportion within each PD-L1 group
+prop.table(tab_pdl1_cd163, margin = 1)
+
+# Concordance: PD-L1-/CD163 low + PD-L1+/CD163 high
+n_concordant <- tab_pdl1_cd163["Negative", "Low"] +
+  tab_pdl1_cd163["Positive", "High"]
+
+n_total <- sum(tab_pdl1_cd163)
+
+cat(
+  "Concordant:", n_concordant, "/", n_total,
+  sprintf("(%.1f%%)", 100 * n_concordant / n_total), "\n",
+  "Discordant:", n_total - n_concordant, "/", n_total,
+  sprintf("(%.1f%%)", 100 * (n_total - n_concordant) / n_total), "\n"
+)
+```
+
+
+
+
+```{r}
+# ============================================================
+# 4-GROUP KAPLAN-MEIER: PD-L1 × CD163
+# ============================================================
+
+ihc_data$immuno_group <- factor(
+  ihc_data$immuno_group,
+  levels = c(
+    "PD-L1- CD163 low",
+    "PD-L1- CD163 high",
+    "PD-L1+ CD163 low",
+    "PD-L1+ CD163 high"
+  )
+)
+
+# ------------------------------------------------------------
+# Survival object
+# ------------------------------------------------------------
+
+surv_obj <- Surv(
+  time = ihc_data$time_death_surv_60m,
+  event = as.numeric(
+    as.character(ihc_data$death_disease_60m)
+  )
+)
+
+# ------------------------------------------------------------
+# Fit KM model
+# ------------------------------------------------------------
+
+km_fit <- survfit(
+  surv_obj ~ immuno_group,
+  data = ihc_data
+)
+
+# ------------------------------------------------------------
+# Colors: light blue = PD-L1-, dark blue = PD-L1+
+# ------------------------------------------------------------
+
+custom_colors <- c(
+   "#6baed6",  # PD-L1- CD163 low
+   "#6baed5",  # PD-L1- CD163 high
+  "#08519d",  # PD-L1+ CD163 low
+  "#08519c"   # PD-L1+ CD163 high
+)
+
+# Dashed = CD163 low
+# Solid  = CD163 high
+
+custom_linetypes <- c(
+  "dashed",
+  "solid",
+  "dashed",
+  "solid"
+)
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+p <- ggsurvplot(
+  km_fit,
+  data = ihc_data,
+  pval = TRUE,
+  risk.table = TRUE,
+  risk.table.height = 0.3,
+  xlab = "Time to Event (Months)",
+  ylab = "Survival Probability",
+  break.time.by = 10,
+  palette = custom_colors,
+  linetype = custom_linetypes,
+  legend.title = "Immuno Group",
+  legend.labs = levels(ihc_data$immuno_group),
+  legend = c(0.8, 0.2),
+  title = "Kaplan-Meier Survival Curve by PD-L1 and CD163 Status"
+)
+
+print(p)
+```
+
+
+
+```{r}
+# ============================================================
+# 5. FOUR-GROUP SUMMARY: N AND EVENTS
+# ============================================================
+
+four_group_summary <- data.frame(
+  Group = levels(ihc_data$immuno_group)
+)
+
+four_group_summary$N <- as.numeric(
+  table(ihc_data$immuno_group)
+)
+
+four_group_summary$Events <- as.numeric(
+  tapply(
+    as.numeric(as.character(ihc_data$death_disease_60m)),
+    ihc_data$immuno_group,
+    sum,
+    na.rm = TRUE
+  )
+)
+
+four_group_summary
+```
+
+
+
+```{r}
+# ============================================================
+# 6. OVERALL FOUR-GROUP LOG-RANK TEST
+# ============================================================
+
+logrank_4group <- survdiff(
+  surv_obj ~ immuno_group,
+  data = ihc_data
+)
+
+logrank_4group_p <- pchisq(
+  logrank_4group$chisq,
+  df = length(logrank_4group$n) - 1,
+  lower.tail = FALSE
+)
+
+cat(
+  "\nOverall 4-group log-rank test:\n",
+  "Chi-square =", round(logrank_4group$chisq, 3),
+  "\nDegrees of freedom =", length(logrank_4group$n) - 1,
+  "\np =", signif(logrank_4group_p, 3),
+  "\n"
+)
+```
+
+
+
+```{r}
+# ============================================================
+# 7. EXPLORATORY FIRTH COX MODEL: HRs, 95% CIs, N AND EVENTS
+#    Reference group: PD-L1- CD163 low
+#    (coxphf CIs are already on the HR scale -> no exp())
+# ============================================================
+
+ihc_data$immuno_group <- relevel(
+  ihc_data$immuno_group,
+  ref = "PD-L1- CD163 low"
+)
+
+cox_4group_firth <- coxphf(
+  surv_obj ~ immuno_group,
+  data = ihc_data,
+  maxstep = 0.0001,
+  maxit = 100000
+)
+
+converged_4group <- check_convergence(cox_4group_firth, 100000)
+
+group_N <- table(ihc_data$immuno_group)
+
+group_events <- tapply(
+  as.numeric(as.character(ihc_data$death_disease_60m)),
+  ihc_data$immuno_group,
+  sum,
+  na.rm = TRUE
+)
+
+cox_4group_results <- data.frame(
+  Group = levels(ihc_data$immuno_group),
+  N = as.numeric(group_N),
+  Events = as.numeric(group_events),
+  coef = c(0, cox_4group_firth$coefficients),
+  HR = c(1, exp(cox_4group_firth$coefficients)),
+  Lower_95CI = c(NA, cox_4group_firth$ci.lower),
+  Upper_95CI = c(NA, cox_4group_firth$ci.upper),
+  P_value = c(NA, cox_4group_firth$prob),
+  converged = converged_4group,
+  row.names = NULL
+)
+
+cox_4group_results
+```
+
+
+
+##Interaction pdl1 and CD163+cells
+```{r}
+# ============================================================
+# 8. FORMAL CD163 × PD-L1 INTERACTION ANALYSIS
+#    Firth-penalized Cox proportional hazards model
+# ============================================================
+
+# ------------------------------------------------------------
+# Prepare variables
+# ------------------------------------------------------------
+
+interaction_data <- ihc_data[
+  ihc_data$immuno_group %in% c(
+    "PD-L1- CD163 low",
+    "PD-L1- CD163 high",
+    "PD-L1+ CD163 low",
+    "PD-L1+ CD163 high"
+  ),
+]
+
+# Create PD-L1 variable
+interaction_data$PDL1 <- ifelse(
+  grepl("PD-L1\\+", interaction_data$immuno_group),
+  "Positive",
+  "Negative"
+)
+
+interaction_data$PDL1 <- factor(
+  interaction_data$PDL1,
+  levels = c("Negative", "Positive")
+)
+
+# Create CD163 variable
+interaction_data$CD163 <- ifelse(
+  grepl("CD163 high", interaction_data$immuno_group),
+  "High",
+  "Low"
+)
+
+interaction_data$CD163 <- factor(
+  interaction_data$CD163,
+  levels = c("Low", "High")
+)
+
+# ------------------------------------------------------------
+# Create binary event variable
+# death_disease_60m is coded as 0/1
+# ------------------------------------------------------------
+
+interaction_data$event <- as.numeric(
+  as.character(interaction_data$death_disease_60m)
+)
+
+# ------------------------------------------------------------
+# Remove incomplete observations
+# ------------------------------------------------------------
+
+interaction_data <- interaction_data[
+  !is.na(interaction_data$time_death_surv_60m) &
+  !is.na(interaction_data$event) &
+  !is.na(interaction_data$PDL1) &
+  !is.na(interaction_data$CD163),
+]
+
+# Check numbers
+table(interaction_data$PDL1, interaction_data$CD163)
+```
+
+```{r}
+# ============================================================
+# Firth Cox model WITHOUT interaction (additive model)
+# ============================================================
+
+cox_no_interaction <- coxphf(
+  Surv(time_death_surv_60m, event) ~
+    CD163 + PDL1,
+  data = interaction_data,
+  maxstep = 0.0001,
+  maxit = 100000
+)
+
+converged_no_int <- check_convergence(cox_no_interaction, 100000)
+
+cox_no_interaction
+converged_no_int
+
+cox_additive_results <- data.frame(
+  Variable = names(cox_no_interaction$coefficients),
+  HR = exp(cox_no_interaction$coefficients),
+  Lower_95CI = cox_no_interaction$ci.lower,
+  Upper_95CI = cox_no_interaction$ci.upper,
+  P_value = cox_no_interaction$prob,
+  converged = converged_no_int,
+  row.names = NULL
+)
+
+cox_additive_results
+```
+
+```{r}
+# ============================================================
+# Firth Cox model WITH CD163 × PD-L1 interaction
+# ============================================================
+
+cox_interaction <- coxphf(
+  Surv(time_death_surv_60m, event) ~
+    CD163 * PDL1,
+  data = interaction_data,
+  maxstep = 0.0001,
+  maxit = 100000
+)
+
+converged_int <- check_convergence(cox_interaction, 100000)
+
+cox_interaction
+converged_int
+
+cox_results <- data.frame(
+  Variable = names(cox_interaction$coefficients),
+  HR = exp(cox_interaction$coefficients),
+  Lower_95CI = cox_interaction$ci.lower,
+  Upper_95CI = cox_interaction$ci.upper,
+  P_value = cox_interaction$prob,
+  converged = converged_int,
+  row.names = NULL
+)
+
+cox_results
+```
+
+
+
+#Does adding the CD163 × PD-L1 interaction significantly improve the Cox model?
+```{r}
+# ============================================================
+# Penalized likelihood ratio test for the CD163 x PD-L1 interaction
+# coxphftest() compares the full model with the model without the
+# interaction term, using the Firth penalty of the full model
+# (the manual comparison of penalized log-likelihoods is not valid).
+# ============================================================
+
+lrt_interaction <- coxphftest(
+  Surv(time_death_surv_60m, event) ~ CD163 * PDL1,
+  test = ~ CD163:PDL1,
+  data = interaction_data
+)
+
+lrt_interaction
+```
+
+
+
+```{r}
+# ============================================================
+# Proportional hazards assumption
+#
+# cox.zph() requires a plain coxph object -- coxphf (Firth) has no
+# residuals/zph method. This fits parallel unpenalized coxph()
+# models with the identical formulas purely for this diagnostic.
+# Effect sizes / inference come from the Firth models above.
+# ============================================================
+
+# Additive model
+cox_additive_ph <- coxph(
+  Surv(time_death_surv_60m, event) ~
+    CD163 + PDL1,
+  data = interaction_data
+)
+
+ph_test_additive <- cox.zph(cox_additive_ph)
+ph_test_additive
+
+# Interaction model
+cox_interaction_ph <- coxph(
+  Surv(time_death_surv_60m, event) ~
+    CD163 * PDL1,
+  data = interaction_data
+)
+
+ph_test <- cox.zph(cox_interaction_ph)
+
+ph_test
+
+plot(ph_test)
+```
+
+
+
+```{r}
+# ============================================================
+# EXPORT - Supplementary Table 9
+# ============================================================
+
+ph_to_df <- function(zph, model_label) {
+  data.frame(
+    model = model_label,
+    term = rownames(zph$table),
+    chisq = round(zph$table[, "chisq"], 3),
+    df = zph$table[, "df"],
+    p = round(zph$table[, "p"], 4),
+    row.names = NULL
+  )
+}
+
+st9 <- list(
+  PDL1_CD163_association = data.frame(
+    PDL1 = rownames(tab_pdl1_cd163),
+    CD163_low = as.numeric(tab_pdl1_cd163[, "Low"]),
+    CD163_high = as.numeric(tab_pdl1_cd163[, "High"]),
+    Fisher_p = c(fisher_pdl1_cd163$p.value, NA),
+    Cutoff_tumor_area = c(paste0(">", cd163_maxstat_cutoff, "%"), NA)
+  ),
+  Four_groups = cox_4group_results,
+  Additive_model = cox_additive_results,
+  Interaction_model = cox_results,
+  PH_tests = rbind(
+    ph_to_df(ph_test_additive, "additive"),
+    ph_to_df(ph_test, "interaction")
+  )
+)
+
+wb <- createWorkbook()
+for (nm in names(st9)) {
+  addWorksheet(wb, nm)
+  writeData(wb, nm, st9[[nm]], headerStyle = createStyle(textDecoration = "bold"))
+  setColWidths(wb, nm, cols = 1:ncol(st9[[nm]]), widths = "auto")
+}
+saveWorkbook(wb, "Supplementary_Table_9_PDL1_CD163.xlsx", overwrite = TRUE)
+```
+
+

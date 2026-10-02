@@ -1,0 +1,639 @@
+
+#XCELL HPV-independent comparison by PDL1 expression
+
+```{r}
+library(coxphf)
+library(knitr)
+library(openxlsx)
+library(immunedeconv)
+library(tidyr)
+library(tibble)
+library(survival)
+library(dplyr)
+library(survminer)
+library(stringr)
+```
+
+
+
+
+#Kaplan Meyer death individual plot
+```{r}
+TP53status_clinical_HPVind$death_disease_60m <- factor(
+  TP53status_clinical_HPVind$death_disease_60m,
+  levels = c(0,1),
+  labels = c("No", "Yes")
+)
+
+# Create the survival object
+surv_obj <- Surv(time = TP53status_clinical_HPVind$time_death_surv_60m, 
+                 event = as.numeric(TP53status_clinical_HPVind$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj ~ pdl1_immune_cells_pos_category, data = TP53status_clinical_HPVind)
+
+ 
+# Define custom colors for groups
+custom_colors <- c("Negative" = "skyblue1", "Positive" = "skyblue4")
+
+# Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = TP53status_clinical_HPVind,
+  pval = TRUE,                    
+  title = "Kaplan-Meier Survival Curve by PDL1_death",
+  risk.table = TRUE,              
+  risk.table.height = 0.3,        
+  xlab = "Time to Event (Months)",
+  ylab = "Survival Probability",   
+  break.time.by = 10,             
+  palette = custom_colors,        # <-- apply custom colors
+  legend = c(0.8, 0.2),           
+  legend.title = "PDL1 status",   
+  legend.labs = c("Negative", "Positive")  # match your groups
+)
+
+print(p)
+```
+  
+
+
+
+
+
+
+
+
+# XCELL
+```{r}
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(
+    cols = -cell_type, # All columns except `cell_type`
+    names_to = "Sample", 
+    values_to = "Fraction"
+  )
+
+analysis_data <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c( "Sample"="id"))
+```
+
+
+
+
+```{r}
+# --- Step 1: Filter out unwanted score cell types and selected immune subsets ---
+exclude_celltypes <- c(
+  "microenvironment score", "immune score", "stroma score",
+"B cell naive",  
+"T cell CD4+ (non-regulatory)",
+ "T cell CD4+ memory",                       
+ "Mast cell",                                                       
+ "NK cell",
+"T cell CD8+ naive",
+"Monocyte",
+"T cell gamma delta",
+"Common lymphoid progenitor",     
+"Common myeloid progenitor", 
+"Granulocyte-monocyte progenitor")
+
+analysis_data <- analysis_data %>%
+  filter(!cell_type %in% exclude_celltypes)
+
+
+length(unique(analysis_data$cell_type))
+#We detect 39 and we keep 25
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(tidyr)
+library(tibble)
+library(ComplexHeatmap)
+library(stringr)
+
+
+# ============================================================
+# 0. Prepare PDL1 status (drop "Unknown", set factor levels)
+# ============================================================
+
+analysis_data_pdl1 <- analysis_data %>%
+  filter(pdl1_immune_cells_pos_category != "Unknown") %>%
+  mutate(
+    pdl1_immune_cells_pos_category = factor(
+      pdl1_immune_cells_pos_category,
+      levels = c("Negative", "Positive")
+    )
+  )
+
+
+# ============================================================
+# 1. Wilcoxon test per cell type + BH-FDR correction
+#    (mirrors `results_hpv` / the corrected `results_p53`)
+# ============================================================
+
+results_pdl1 <- analysis_data_pdl1 %>%
+  filter(!is.na(pdl1_immune_cells_pos_category), !is.na(Fraction)) %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_negative = sum(pdl1_immune_cells_pos_category == "Negative"),
+    n_positive = sum(pdl1_immune_cells_pos_category == "Positive"),
+    p_value    = wilcox.test(Fraction ~ pdl1_immune_cells_pos_category)$p.value,
+    median_negative = median(Fraction[pdl1_immune_cells_pos_category == "Negative"], na.rm = TRUE),
+    median_positive = median(Fraction[pdl1_immune_cells_pos_category == "Positive"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Benjamini-Hochberg FDR correction across ALL cell types tested
+    FDR = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(FDR)
+
+# View all results
+results_pdl1
+
+
+# ============================================================
+# 2. Keep only FDR-significant cell types
+# ============================================================
+
+significant_results <- results_pdl1 %>%
+  filter(FDR < 0.05)
+
+significant_cell_types <- significant_results$cell_type
+
+significant_data <- analysis_data_pdl1 %>%
+  filter(cell_type %in% significant_cell_types) %>%
+  left_join(
+    significant_results %>%
+      select(cell_type, p_value, FDR, median_negative, median_positive),
+    by = "cell_type"
+  )
+
+
+# ============================================================
+# 3. Boxplot/jitter panel of FDR-significant cell types
+#    (guarded in case nothing survives correction)
+# ============================================================
+
+if (length(significant_cell_types) == 0) {
+
+  message("No cell types reached FDR < 0.05 for PDL1 status within HPV-independent tumors.")
+
+} else {
+
+  analysis_data_significant <- analysis_data_pdl1 %>%
+    filter(
+      cell_type %in% significant_cell_types,
+      !is.na(pdl1_immune_cells_pos_category),
+      !is.na(Fraction)
+    ) %>%
+    mutate(
+      cell_type = factor(cell_type, levels = significant_cell_types),
+      pdl1_immune_cells_pos_category = factor(
+        pdl1_immune_cells_pos_category,
+        levels = c("Negative", "Positive")
+      )
+    )
+
+  # Check how many observations each cell type has
+  print(table(analysis_data_significant$cell_type))
+
+  plot_labels <- significant_results %>%
+    mutate(
+      cell_type = factor(cell_type, levels = significant_cell_types),
+      FDR_label = paste0("FDR = ", format.pval(FDR, digits = 2, eps = 0.001))
+    )
+
+  PDL1plot <- ggplot(
+    analysis_data_significant,
+    aes(x = pdl1_immune_cells_pos_category, y = Fraction, fill = pdl1_immune_cells_pos_category)
+  ) +
+
+    geom_boxplot(width = 0.45, outlier.shape = NA) +
+
+    geom_jitter(
+      aes(color = pdl1_immune_cells_pos_category),
+      width = 0.08,
+      size = 1.5,
+      alpha = 0.65
+    ) +
+
+    facet_wrap(
+      ~cell_type,
+      scales = "free_y",
+      nrow = 3,
+      ncol = 4
+    ) +
+
+    geom_text(
+      data = plot_labels,
+      aes(x = 1.5, y = Inf, label = FDR_label),
+      inherit.aes = FALSE,
+      vjust = 1.5,
+      size = 3.5
+    ) +
+
+    scale_fill_manual(
+      values = c("Negative" = "skyblue1", "Positive" = "skyblue4")
+    ) +
+
+    scale_color_manual(
+      values = c("Negative" = "dodgerblue3", "Positive" = "darkblue")
+    ) +
+
+    theme_minimal() +
+
+    labs(
+      title = "Cell Type Fractions by PDL1 Status (HPV-independent)",
+      x = "PDL1 Immune Cells Status",
+      y = "xCell Score",
+      fill = "PDL1 Status",
+      color = "PDL1 Status"
+    ) +
+
+    theme(
+      panel.spacing = unit(0.8, "lines"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 11, face = "bold"),
+      plot.title = element_text(size = 16, face = "bold")
+    ) +
+
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+
+  print(PDL1plot)
+
+}
+
+
+
+
+# ============================================================
+# 5. Scores (microenvironment / immune / stroma): FDR version
+#    (mirrors the "For scores" section in your original script)
+# ============================================================
+
+hpv_ind_xcell <- deconvolute(counts_HPV_Independent, "xcell")
+
+hpv_ind_xcell_long <- hpv_ind_xcell %>%
+  pivot_longer(cols = -cell_type, names_to = "Sample", values_to = "Fraction")
+
+analysis_data_full <- hpv_ind_xcell_long %>%
+  left_join(TP53status_clinical_HPVind, by = c("Sample" = "id"))
+
+scores_only <- c("microenvironment score", "immune score", "stroma score")
+
+analysis_data_scores <- analysis_data_full %>%
+  filter(cell_type %in% scores_only)
+
+unique(analysis_data_scores$cell_type)
+
+scores_data <- analysis_data_scores %>%
+  filter(pdl1_immune_cells_pos_category != "Unknown") %>%
+  select(Sample, cell_type, Fraction, pdl1_immune_cells_pos_category) %>%
+  filter(!is.na(pdl1_immune_cells_pos_category), !is.na(Fraction)) %>%
+  mutate(
+    pdl1_immune_cells_pos_category = factor(
+      pdl1_immune_cells_pos_category,
+      levels = c("Negative", "Positive")
+    )
+  )
+
+table(scores_data$pdl1_immune_cells_pos_category)
+unique(scores_data$cell_type)
+
+# --- Wilcoxon tests + BH-FDR correction across the 3 xCell scores ---
+results_scores_pdl1 <- scores_data %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_negative = sum(pdl1_immune_cells_pos_category == "Negative"),
+    n_positive = sum(pdl1_immune_cells_pos_category == "Positive"),
+    median_negative = median(Fraction[pdl1_immune_cells_pos_category == "Negative"], na.rm = TRUE),
+    median_positive = median(Fraction[pdl1_immune_cells_pos_category == "Positive"], na.rm = TRUE),
+    p_value = wilcox.test(Fraction ~ pdl1_immune_cells_pos_category)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FDR = p.adjust(p_value, method = "BH"),
+    significant = FDR < 0.05
+  ) %>%
+  arrange(FDR)
+
+results_scores_pdl1
+```
+
+
+
+```{r}
+# ============================================================
+# 5. xCell scores: p-value + FDR
+# ============================================================
+
+score_order <- c(
+  "microenvironment score",
+  "immune score",
+  "stroma score"
+)
+
+scores_data <- scores_data %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = score_order
+    )
+  )
+
+# ------------------------------------------------------------
+# Labels with both nominal p-value and FDR
+# ------------------------------------------------------------
+
+score_labels <- results_scores_pdl1 %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = score_order
+    ),
+
+    p_label = case_when(
+      p_value < 0.01 ~ "p < 0.01",
+      TRUE ~ paste0("p = ", sprintf("%.3f", p_value))
+    ),
+
+    FDR_label = case_when(
+      FDR < 0.01 ~ "FDR < 0.01",
+      TRUE ~ paste0("FDR = ", sprintf("%.3f", FDR))
+    ),
+
+    label = paste0(
+      p_label,
+      "\n",
+      FDR_label
+    )
+  )
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+PDL1plot_scores_FDR <- ggplot(
+  scores_data,
+  aes(
+    x = cell_type,
+    y = Fraction,
+    fill = pdl1_immune_cells_pos_category
+  )
+) +
+
+  geom_boxplot(
+    width = 0.45,
+    outlier.shape = NA,
+    position = position_dodge(width = 0.6)
+  ) +
+
+  geom_jitter(
+    aes(color = pdl1_immune_cells_pos_category),
+    size = 1.5,
+    alpha = 0.65,
+    position = position_jitterdodge(
+      jitter.width = 0.08,
+      dodge.width = 0.6
+    )
+  ) +
+
+  geom_text(
+    data = score_labels,
+    aes(
+      x = cell_type,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    vjust = 1.5,
+    size = 3.5
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Negative" = "skyblue1",
+      "Positive" = "skyblue4"
+    )
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Negative" = "dodgerblue3",
+      "Positive" = "darkblue"
+    )
+  ) +
+
+  scale_x_discrete(
+    labels = c(
+      "microenvironment score" = "Microenvironment score",
+      "immune score" = "Immune score",
+      "stroma score" = "Stroma score"
+    )
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "xCell Scores by PDL1 Status (HPV-independent)",
+    subtitle = "Nominal p-value and BH-adjusted FDR",
+    x = "Score Type",
+    y = "xCell Score",
+    fill = "PDL1 Status",
+    color = "PDL1 Status"
+  ) +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    plot.title = element_text(
+      size = 16,
+      face = "bold"
+    )
+  )
+
+PDL1plot_scores_FDR
+```
+
+
+```{r}
+# ============================================================
+# 6. Individual cell types with nominal p < 0.1
+#    Plot both nominal p-value and BH-FDR
+# ============================================================
+
+nominal_results <- results_pdl1 %>%
+  filter(p_value < 0.1) %>%
+  arrange(p_value)
+
+nominal_cell_types <- nominal_results$cell_type
+
+print(nominal_results)
+print(nominal_cell_types)
+
+if (length(nominal_cell_types) == 0) {
+
+  message(
+    paste0(
+      "No individual cell types reached nominal p < 0.1 ",
+      "for PDL1 status within HPV-independent tumors."
+    )
+  )
+
+} else {
+
+
+  # ----------------------------------------------------------
+  # Data for nominally associated cell types
+  # ----------------------------------------------------------
+
+  analysis_data_nominal <- analysis_data_pdl1 %>%
+    filter(
+      cell_type %in% nominal_cell_types,
+      !is.na(pdl1_immune_cells_pos_category),
+      !is.na(Fraction)
+    ) %>%
+    mutate(
+      cell_type = factor(
+        cell_type,
+        levels = nominal_cell_types
+      ),
+      pdl1_immune_cells_pos_category = factor(
+        pdl1_immune_cells_pos_category,
+        levels = c("Negative", "Positive")
+      )
+    )
+
+  print(table(analysis_data_nominal$cell_type))
+
+  # ----------------------------------------------------------
+  # Plot labels
+  # ----------------------------------------------------------
+
+  nominal_labels <- nominal_results %>%
+    mutate(
+      cell_type = factor(
+        cell_type,
+        levels = nominal_cell_types
+      ),
+
+      p_label = case_when(
+        p_value < 0.01 ~ "p < 0.01",
+        TRUE ~ paste0("p = ", sprintf("%.3f", p_value))
+      ),
+
+      FDR_label = case_when(
+        FDR < 0.01 ~ "FDR < 0.01",
+        TRUE ~ paste0("FDR = ", sprintf("%.3f", FDR))
+      ),
+
+      label = paste0(
+        p_label,
+        "\n",
+        FDR_label
+      )
+    )
+
+  # ----------------------------------------------------------
+  # Plot
+  # ----------------------------------------------------------
+
+  PDL1plot_nominal <- ggplot(
+    analysis_data_nominal,
+    aes(
+      x = pdl1_immune_cells_pos_category,
+      y = Fraction,
+      fill = pdl1_immune_cells_pos_category
+    )
+  ) +
+
+    geom_boxplot(
+      width = 0.45,
+      outlier.shape = NA
+    ) +
+
+    geom_jitter(
+      aes(color = pdl1_immune_cells_pos_category),
+      width = 0.08,
+      size = 1.5,
+      alpha = 0.65
+    ) +
+
+    facet_wrap(
+      ~cell_type,
+      scales = "free_y",
+      nrow = 3,
+      ncol = 4
+    ) +
+
+    geom_text(
+      data = nominal_labels,
+      aes(
+        x = 1.5,
+        y = Inf,
+        label = label
+      ),
+      inherit.aes = FALSE,
+      vjust = 1.5,
+      size = 3.5
+    ) +
+
+    scale_fill_manual(
+      values = c(
+        "Negative" = "skyblue1",
+        "Positive" = "skyblue4"
+      )
+    ) +
+
+    scale_color_manual(
+      values = c(
+        "Negative" = "dodgerblue3",
+        "Positive" = "darkblue"
+      )
+    ) +
+
+    theme_minimal() +
+
+    labs(
+      title = "Cell Types with Nominal p < 0.1 by PDL1 Status",
+      subtitle = "HPV-independent tumors; nominal p-value and BH-adjusted FDR",
+      x = "PDL1 Immune Cells Status",
+      y = "xCell Score",
+      fill = "PDL1 Status",
+      color = "PDL1 Status"
+    ) +
+
+    theme(
+      panel.spacing = unit(0.8, "lines"),
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      ),
+      strip.text = element_text(
+        size = 11,
+        face = "bold"
+      ),
+      plot.title = element_text(
+        size = 16,
+        face = "bold"
+      )
+    ) +
+
+    scale_x_discrete(
+      labels = function(x) str_wrap(x, width = 10)
+    )
+
+  print(PDL1plot_nominal)
+}
+```
+

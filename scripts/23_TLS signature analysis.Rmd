@@ -1,0 +1,299 @@
+
+#TLS 12-chemokine signature
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(edgeR)
+library(GSVA)
+library(immunedeconv)
+library(survival)
+library(survminer)
+library(coxphf)
+library(maxstat)
+library(ComplexHeatmap)
+library(ggplot2)
+library(ggpubr)
+library(openxlsx)
+
+set.seed(1)
+
+tls_genes <- c("CCL2", "CCL3", "CCL4", "CCL5", "CCL8", "CCL18", "CCL19",
+               "CCL21", "CXCL9", "CXCL10", "CXCL11", "CXCL13")
+```
+
+```{r}
+# =============================================================================
+# 1. EXPRESSION AND TLS SCORE
+# =============================================================================
+
+dge <- calcNormFactors(DGEList(counts = as.matrix(counts_filtered_filtered)))
+logcpm <- cpm(dge, log = TRUE, prior.count = 1)
+
+gene_check <- data.frame(gene = tls_genes, on_panel = tls_genes %in% rownames(logcpm))
+gene_check
+tls_present <- tls_genes[tls_genes %in% rownames(logcpm)]
+stopifnot(length(tls_present) >= 10)
+
+# GSVA score (compatible with old and new GSVA interfaces)
+gset <- list(TLS_12chemokine = tls_present)
+if (exists("gsvaParam", where = asNamespace("GSVA"))) {
+  gsva_scores <- gsva(gsvaParam(logcpm, gset, kcdf = "Gaussian"), verbose = FALSE)
+} else {
+  gsva_scores <- gsva(logcpm, gset, method = "gsva", kcdf = "Gaussian", verbose = FALSE)
+}
+
+# Mean z-score of the 12 genes (simple, method-independent alternative)
+z <- t(scale(t(logcpm[tls_present, ])))
+tls_df <- data.frame(
+  id        = colnames(logcpm),
+  TLS_gsva  = as.numeric(gsva_scores["TLS_12chemokine", ]),
+  TLS_zmean = colMeans(z)
+) %>%
+  left_join(TP53status_clinical, by = "id") %>%
+  mutate(
+    HPV   = factor(ifelse(hpv_status == "Positive", "HPV-A", "HPV-I"), levels = c("HPV-A", "HPV-I")),
+    event_dss = as.numeric(as.character(death_disease_60m)),
+    event_rfs = as.numeric(as.character(recurrence_60m))
+  )
+
+cat("Agreement between GSVA and z-score TLS scores (Spearman):",
+    round(cor(tls_df$TLS_gsva, tls_df$TLS_zmean, method = "spearman"), 2), "\n")
+
+# Internal coherence of the signature (median pairwise gene-gene correlation)
+cc <- cor(t(logcpm[tls_present, ]), method = "spearman")
+cat("Median gene-gene Spearman correlation:", round(median(cc[upper.tri(cc)]), 2), "\n")
+```
+
+```{r}
+# =============================================================================
+# 2. HEATMAP OF THE 12 GENES
+# =============================================================================
+
+ord <- order(tls_df$HPV, tls_df$TLS_gsva)
+ha <- HeatmapAnnotation(
+  HPV = tls_df$HPV[ord],
+  `TLS score` = anno_barplot(tls_df$TLS_gsva[ord]),
+  col = list(HPV = c("HPV-A" = "#F8766D", "HPV-I" = "#7B7BE0"))
+)
+
+ht <- Heatmap(z[, ord], name = "Z-score", top_annotation = ha,
+              cluster_columns = FALSE, show_column_names = FALSE,
+              column_split = tls_df$HPV[ord],
+              row_title = "12-chemokine TLS signature")
+draw(ht)
+```
+
+```{r}
+# =============================================================================
+# 3. GROUP COMPARISONS (Wilcoxon)
+# =============================================================================
+
+hpvi <- tls_df %>% filter(HPV == "HPV-I")
+
+comparisons <- bind_rows(
+  data.frame(comparison = "HPV-A vs HPV-I",
+             score = c("TLS_gsva", "TLS_zmean"),
+             p = sapply(c("TLS_gsva", "TLS_zmean"), function(s)
+               wilcox.test(tls_df[[s]] ~ tls_df$HPV)$p.value)),
+  data.frame(comparison = "HPV-I: p53 normal vs abnormal",
+             score = c("TLS_gsva", "TLS_zmean"),
+             p = sapply(c("TLS_gsva", "TLS_zmean"), function(s)
+               wilcox.test(hpvi[[s]] ~ hpvi$p53_ihc_status)$p.value)),
+  data.frame(comparison = "HPV-I: PD-L1 negative vs positive",
+             score = c("TLS_gsva", "TLS_zmean"),
+             p = sapply(c("TLS_gsva", "TLS_zmean"), function(s)
+               wilcox.test(hpvi[[s]] ~ hpvi$pdl1_immune_cells_pos_category)$p.value))
+)
+rownames(comparisons) <- NULL
+comparisons
+
+# Single pre-specified comparison per group contrast: nominal Wilcoxon p-values
+p_hpv <- comparisons$p[comparisons$comparison == "HPV-A vs HPV-I" & comparisons$score == "TLS_gsva"]
+
+fig_R1 <- ggplot(tls_df, aes(HPV, TLS_gsva, fill = HPV)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.5) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.7) +
+  annotate("text", x = 1.5, y = max(tls_df$TLS_gsva) * 1.15,
+           label = sprintf("Wilcoxon p = %.3f", p_hpv)) +
+  scale_fill_manual(values = c("HPV-A" = "#F8766D", "HPV-I" = "#7B7BE0")) +
+  labs(x = NULL, y = "12-chemokine TLS signature score (GSVA)") +
+  theme_classic(base_size = 13) + theme(legend.position = "none")
+fig_R1
+```
+
+```{r}
+# =============================================================================
+# 4. CORRELATION WITH xCELL POPULATIONS (HPV-I)
+# =============================================================================
+
+xcell_hpvi <- deconvolute(as.matrix(counts_filtered_filtered[, hpvi$id]), "xcell")
+
+exclude_celltypes <- c(
+  # low-prevalence populations excluded in the main analysis
+  "B cell naive", "T cell CD4+ (non-regulatory)", "T cell CD4+ memory",
+  "Mast cell", "NK cell", "T cell CD8+ naive", "Monocyte", "T cell gamma delta",
+  # progenitors
+  "Common lymphoid progenitor", "Common myeloid progenitor",
+  "Granulocyte-monocyte progenitor"
+)
+
+xcell_long <- xcell_hpvi %>%
+  filter(!cell_type %in% exclude_celltypes) %>%
+  pivot_longer(-cell_type, names_to = "id", values_to = "Fraction") %>%
+  left_join(hpvi %>% select(id, TLS_gsva), by = "id")
+
+cat("xCell variables analysed:", length(unique(xcell_long$cell_type)), "\n")   # 28
+stopifnot(length(unique(xcell_long$cell_type)) == 28)
+
+cor_xcell <- xcell_long %>%
+  group_by(cell_type) %>%
+  summarise(
+    rho = cor.test(Fraction, TLS_gsva, method = "spearman", exact = FALSE)$estimate,
+    p   = cor.test(Fraction, TLS_gsva, method = "spearman", exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(FDR = p.adjust(p, method = "BH")) %>%
+  arrange(p)
+
+cor_xcell %>% mutate(across(c(rho, p, FDR), ~ round(.x, 3))) %>% print(n = 40)
+```
+
+```{r}
+# =============================================================================
+# 5. CORRELATION WITH CD123 / CD163 IHC (HPV-I)
+# =============================================================================
+
+ihc_long <- bind_rows(
+  CD123_5 %>% mutate(marker = "CD123"),
+  CD163   %>% mutate(marker = "CD163")
+) %>%
+  pivot_longer(starts_with("Positive_cells"), names_to = "compartment", values_to = "pct") %>%
+  inner_join(hpvi %>% select(id, TLS_gsva), by = c("Case_ID" = "id"))
+
+cor_ihc <- ihc_long %>%
+  group_by(marker, compartment) %>%
+  summarise(
+    n   = sum(!is.na(pct)),
+    rho = cor.test(pct, TLS_gsva, method = "spearman", exact = FALSE)$estimate,
+    p   = cor.test(pct, TLS_gsva, method = "spearman", exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(FDR = p.adjust(p, method = "BH"))
+
+cor_ihc %>% mutate(across(c(rho, p, FDR), ~ round(.x, 3)))
+```
+
+```{r}
+# =============================================================================
+# 6. SURVIVAL IN HPV-I (Firth Cox), RFS and DSS
+# =============================================================================
+
+fdr_select <- 0.10   # selection threshold for multivariable models (as in main analyses)
+
+hpvi <- hpvi %>%
+  mutate(
+    TLS_sd         = as.numeric(scale(TLS_gsva)),
+    figo_ini_ava   = relevel(factor(figo_ini_ava), ref = "1 (Advanced)"),
+    p53_ihc_status = relevel(factor(p53_ihc_status), ref = "Mutant")
+  )
+
+maxstat_cut <- function(time, event, x) {
+  d <- data.frame(time, event, x)
+  unname(maxstat.test(Surv(time, event) ~ x, data = d, smethod = "LogRank",
+                      pmethod = "Lau92", minprop = 0.2, maxprop = 0.8)$estimate)
+}
+
+prep_endpoint <- function(time_var, event_var) {
+  d <- hpvi
+  d$time  <- d[[time_var]]
+  d$event <- d[[event_var]]
+  cut_max <- maxstat_cut(d$time, d$event, d$TLS_gsva)
+  d$TLS_median  <- factor(ifelse(d$TLS_gsva > median(d$TLS_gsva), "High", "Low"), levels = c("Low", "High"))
+  d$TLS_maxstat <- factor(ifelse(d$TLS_gsva > cut_max, "High", "Low"), levels = c("Low", "High"))
+  attr(d, "cut_max") <- cut_max
+  d
+}
+
+fit_one <- function(d, endpoint, term, label, adjusted) {
+  f <- as.formula(paste("Surv(time, event) ~", term,
+                        if (adjusted) "+ figo_ini_ava + p53_ihc_status" else ""))
+  m <- coxphf(f, data = d, maxstep = 0.0001, maxit = 100000)
+  data.frame(
+    endpoint = endpoint, approach = label,
+    model = ifelse(adjusted, "multivariable", "univariable"),
+    cutoff = switch(label, continuous = NA,
+                    median  = round(median(d$TLS_gsva), 3),
+                    maxstat = round(attr(d, "cut_max"), 3)),
+    n_low_high = if (label == "continuous") NA else paste(table(d[[term]]), collapse = "/"),
+    events_low_high = if (label == "continuous") NA else
+      paste(tapply(d$event, d[[term]], sum), collapse = "/"),
+    HR = exp(m$coefficients[1]), lower = m$ci.lower[1], upper = m$ci.upper[1],
+    p = m$prob[1], row.names = NULL
+  )
+}
+
+terms <- c(continuous = "TLS_sd", median = "TLS_median", maxstat = "TLS_maxstat")
+endpoints <- list(RFS = c("time_recurrence_surv_60m", "event_rfs"),
+                  DSS = c("time_death_surv_60m", "event_dss"))
+data_ep <- lapply(endpoints, function(e) prep_endpoint(e[1], e[2]))
+
+# ---- (i) univariable --------------------------------------------------------
+uni_tls <- bind_rows(lapply(names(endpoints), function(ep)
+  bind_rows(lapply(names(terms), function(a)
+    fit_one(data_ep[[ep]], ep, terms[[a]], a, adjusted = FALSE))))) %>%
+  group_by(endpoint) %>%
+  mutate(p_adj_BH = p.adjust(p, method = "BH")) %>%
+  ungroup()
+
+selected_endpoints <- uni_tls %>%
+  filter(p_adj_BH < fdr_select) %>%
+  pull(endpoint) %>% unique()
+cat("Endpoints carried forward to multivariable models:",
+    if (length(selected_endpoints)) paste(selected_endpoints, collapse = ", ") else "none", "\n")
+
+# ---- (ii) multivariable (only selected endpoints) ---------------------------
+multi_tls <- if (length(selected_endpoints) > 0) {
+  bind_rows(lapply(selected_endpoints, function(ep)
+    bind_rows(lapply(names(terms), function(a)
+      fit_one(data_ep[[ep]], ep, terms[[a]], a, adjusted = TRUE))))) %>%
+    group_by(endpoint) %>%
+    mutate(p_adj_BH = p.adjust(p, method = "BH")) %>%
+    ungroup()
+} else data.frame()
+
+surv_tls <- bind_rows(uni_tls, multi_tls) %>%
+  mutate(across(c(HR, lower, upper, p, p_adj_BH), ~ round(.x, 3)))
+
+surv_tls
+
+# Kaplan-Meier (median split)
+km_data <- hpvi %>%
+  mutate(TLS_group = factor(ifelse(TLS_gsva > median(TLS_gsva), "High", "Low"),
+                            levels = c("Low", "High")))
+km_opts <- list(pval = TRUE, risk.table = TRUE, risk.table.height = 0.25,
+                risk.table.y.text = FALSE, risk.table.col = "strata",
+                palette = c("gray50", "black"), legend.labs = c("Low", "High"),
+                legend.title = "TLS signature", xlab = "Time (months)")
+km_rfs <- do.call(ggsurvplot, c(list(survfit(Surv(time_recurrence_surv_60m, event_rfs) ~ TLS_group,
+                                             data = km_data), data = km_data, ylab = "RFS"), km_opts))
+km_dss <- do.call(ggsurvplot, c(list(survfit(Surv(time_death_surv_60m, event_dss) ~ TLS_group,
+                                             data = km_data), data = km_data, ylab = "DSS"), km_opts))
+km_rfs; km_dss
+
+# Kaplan-Meier (maxstat-derived cut-off; endpoint-specific, same as in the Cox models)
+km_maxstat <- function(ep, ylab_txt) {
+  d <- data_ep[[ep]]
+  do.call(ggsurvplot, c(list(survfit(Surv(time, event) ~ TLS_maxstat, data = d),
+                             data = d, ylab = ylab_txt,
+                             title = sprintf("%s by TLS signature (maxstat cut-off = %.3f)",
+                                             ep, attr(d, "cut_max"))), km_opts))
+}
+km_rfs_maxstat <- km_maxstat("RFS", "RFS")
+km_dss_maxstat <- km_maxstat("DSS", "DSS")
+km_rfs_maxstat; km_dss_maxstat
+```
+
+
+
