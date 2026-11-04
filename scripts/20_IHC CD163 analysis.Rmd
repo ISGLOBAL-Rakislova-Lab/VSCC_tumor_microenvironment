@@ -659,7 +659,7 @@ print(selected_DSS_ihc)
 ```{r}
 # ============================================================================
 # DSS — MULTIVARIATE MAXSTAT / MEDIAN
-# adjusted for FIGO + p53
+# adjusted for FIGO + p53 + PD-L1
 # ============================================================================
 
 perform_cox_DSS_ihc_multiv <- function(
@@ -4212,25 +4212,6 @@ cox_results
 
 
 
-#Does adding the CD163 × PD-L1 interaction significantly improve the Cox model?
-```{r}
-# ============================================================
-# Penalized likelihood ratio test for the CD163 x PD-L1 interaction
-# coxphftest() compares the full model with the model without the
-# interaction term, using the Firth penalty of the full model
-# (the manual comparison of penalized log-likelihoods is not valid).
-# ============================================================
-
-lrt_interaction <- coxphftest(
-  Surv(time_death_surv_60m, event) ~ CD163 * PDL1,
-  test = ~ CD163:PDL1,
-  data = interaction_data
-)
-
-lrt_interaction
-```
-
-
 
 ```{r}
 # ============================================================
@@ -4268,33 +4249,161 @@ plot(ph_test)
 
 
 
+
+
+
+#Does adding the CD163 x PD-L1 interaction significantly improve the Cox model?
+```{r}
+# ============================================================
+# Penalized likelihood ratio test for the CD163 x PD-L1 interaction
+# ============================================================
+
+interaction_data$cd163_high <- as.numeric(interaction_data$CD163 == "High")
+interaction_data$pdl1_pos   <- as.numeric(interaction_data$PDL1  == "Positive")
+interaction_data$cd163_x_pdl1 <- interaction_data$cd163_high * interaction_data$pdl1_pos
+
+lrt_interaction <- coxphftest(
+  Surv(time_death_surv_60m, event) ~ cd163_high + pdl1_pos + cd163_x_pdl1,
+  test  = ~ cd163_x_pdl1,
+  data  = interaction_data,
+  maxit = 1000
+)
+
+lrt_interaction
+
+lrt_chisq <- 2 * diff(lrt_interaction$loglik)
+lrt_df    <- lrt_interaction$df
+lrt_p     <- lrt_interaction$prob
+
+stopifnot(lrt_df == 1)   # guards against the silent "0 df, p = 1" failure
+
+cat("Penalized LRT for interaction: chi2 =", round(lrt_chisq, 3),
+    "on", lrt_df, "df, p =", signif(lrt_p, 3), "\n")
+```
+
+
 ```{r}
 # ============================================================
 # EXPORT - Supplementary Table 9
 # ============================================================
 
+fmt_hr <- function(x) formatC(x, format = "f", digits = 2)
+fmt_p  <- function(p) ifelse(is.na(p), "",
+                             ifelse(p < 0.001, "<0.001",
+                                    formatC(p, format = "f", digits = 3)))
+
+n_total  <- nrow(interaction_data)
+ev_total <- sum(interaction_data$event)
+
+# Group N / events, used to label the terms of the additive and
+# interaction models
+n_ev <- function(rows) {
+  c(N = sum(rows), Events = sum(interaction_data$event[rows]))
+}
+grp_cd163_high <- n_ev(interaction_data$CD163 == "High")
+grp_cd163_low  <- n_ev(interaction_data$CD163 == "Low")
+grp_pdl1_pos   <- n_ev(interaction_data$PDL1  == "Positive")
+grp_pdl1_neg   <- n_ev(interaction_data$PDL1  == "Negative")
+
+row_from_model <- function(model, coef_name, section, term, n = "", events = "") {
+  data.frame(
+    Model    = section,
+    Term     = term,
+    N        = as.character(n),
+    Events   = as.character(events),
+    HR       = fmt_hr(exp(model$coefficients[[coef_name]])),
+    `95% CI` = paste0(fmt_hr(model$ci.lower[[coef_name]]), "–",
+                      fmt_hr(model$ci.upper[[coef_name]])),
+    `p-value` = fmt_p(model$prob[[coef_name]]),
+    check.names = FALSE, stringsAsFactors = FALSE
+  )
+}
+
+# ---------- A. Four-group model ---------------------------------------------
+four_group_rows <- data.frame(
+  Model    = "A. Four-group model (reference: PD-L1−/CD163-low)",
+  Term     = sub("PD-L1- ", "PD-L1−/", sub("PD-L1\\+ ", "PD-L1+/",
+                 sub(" low", "-low", sub(" high", "-high", cox_4group_results$Group)))),
+  N        = as.character(cox_4group_results$N),
+  Events   = as.character(cox_4group_results$Events),
+  HR       = ifelse(is.na(cox_4group_results$Lower_95CI), "1 (ref)",
+                    fmt_hr(cox_4group_results$HR)),
+  `95% CI` = ifelse(is.na(cox_4group_results$Lower_95CI), "",
+                    paste0(fmt_hr(cox_4group_results$Lower_95CI), "–",
+                           fmt_hr(cox_4group_results$Upper_95CI))),
+  `p-value` = fmt_p(cox_4group_results$P_value),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+
+# ---------- B. Two-variable (additive) model --------------------------------
+additive_rows <- rbind(
+  row_from_model(cox_no_interaction, "CD163High",
+                 "B. Two-variable model (CD163 + PD-L1)",
+                 "CD163-high vs CD163-low",
+                 paste0(grp_cd163_high["N"], " vs ", grp_cd163_low["N"]),
+                 paste0(grp_cd163_high["Events"], " vs ", grp_cd163_low["Events"])),
+  row_from_model(cox_no_interaction, "PDL1Positive",
+                 "B. Two-variable model (CD163 + PD-L1)",
+                 "PD-L1+ vs PD-L1−",
+                 paste0(grp_pdl1_pos["N"], " vs ", grp_pdl1_neg["N"]),
+                 paste0(grp_pdl1_pos["Events"], " vs ", grp_pdl1_neg["Events"]))
+)
+
+# ---------- C. Interaction model --------------------------------------------
+interaction_rows <- rbind(
+  row_from_model(cox_interaction, "CD163High",
+                 "C. Interaction model (CD163 × PD-L1)",
+                 "CD163-high vs CD163-low (within PD-L1−)"),
+  row_from_model(cox_interaction, "PDL1Positive",
+                 "C. Interaction model (CD163 × PD-L1)",
+                 "PD-L1+ vs PD-L1− (within CD163-low)"),
+  row_from_model(cox_interaction, "CD163High:PDL1Positive",
+                 "C. Interaction model (CD163 × PD-L1)",
+                 "CD163 × PD-L1 interaction (ratio of HRs)"),
+  data.frame(
+    Model    = "C. Interaction model (CD163 × PD-L1)",
+    Term     = paste0("Penalized likelihood-ratio test for the interaction (χ² = ",
+                      formatC(lrt_chisq, format = "f", digits = 2), ", ",
+                      lrt_df, " df)"),
+    N = "", Events = "", HR = "", `95% CI` = "",
+    `p-value` = fmt_p(lrt_p),
+    check.names = FALSE, stringsAsFactors = FALSE
+  )
+)
+
+st9_formatted <- rbind(four_group_rows, additive_rows, interaction_rows)
+st9_formatted
+
+
+
+# ---------- Write workbook ---------------------------------------------------
 ph_to_df <- function(zph, model_label) {
   data.frame(
     model = model_label,
-    term = rownames(zph$table),
+    term  = rownames(zph$table),
     chisq = round(zph$table[, "chisq"], 3),
-    df = zph$table[, "df"],
-    p = round(zph$table[, "p"], 4),
+    df    = zph$table[, "df"],
+    p     = round(zph$table[, "p"], 4),
     row.names = NULL
   )
 }
 
 st9 <- list(
+  Supplementary_Table_9 = st9_formatted,
   PDL1_CD163_association = data.frame(
     PDL1 = rownames(tab_pdl1_cd163),
-    CD163_low = as.numeric(tab_pdl1_cd163[, "Low"]),
+    CD163_low  = as.numeric(tab_pdl1_cd163[, "Low"]),
     CD163_high = as.numeric(tab_pdl1_cd163[, "High"]),
-    Fisher_p = c(fisher_pdl1_cd163$p.value, NA),
+    Fisher_p   = c(fisher_pdl1_cd163$p.value, NA),
     Cutoff_tumor_area = c(paste0(">", cd163_maxstat_cutoff, "%"), NA)
   ),
-  Four_groups = cox_4group_results,
-  Additive_model = cox_additive_results,
+  Four_groups       = cox_4group_results,
+  Additive_model    = cox_additive_results,
   Interaction_model = cox_results,
+  Interaction_LRT   = data.frame(
+    test  = "CD163 x PD-L1 interaction (penalized LRT)",
+    chisq = lrt_chisq, df = lrt_df, p = lrt_p
+  ),
   PH_tests = rbind(
     ph_to_df(ph_test_additive, "additive"),
     ph_to_df(ph_test, "interaction")
@@ -4302,12 +4411,14 @@ st9 <- list(
 )
 
 wb <- createWorkbook()
+bold <- createStyle(textDecoration = "bold")
 for (nm in names(st9)) {
   addWorksheet(wb, nm)
-  writeData(wb, nm, st9[[nm]], headerStyle = createStyle(textDecoration = "bold"))
+  writeData(wb, nm, st9[[nm]], headerStyle = bold)
   setColWidths(wb, nm, cols = 1:ncol(st9[[nm]]), widths = "auto")
 }
 saveWorkbook(wb, "Supplementary_Table_9_PDL1_CD163.xlsx", overwrite = TRUE)
 ```
+
 
 

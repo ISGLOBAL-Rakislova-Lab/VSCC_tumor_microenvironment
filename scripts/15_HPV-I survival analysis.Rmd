@@ -2175,3 +2175,20 @@ forest_RFS_unadjusted <- make_forest_combined(
 )
 ```
 
+
+
+```{r}
+# Export Supplementary Data 2: proportional-hazards tests (xCell)
+library(openxlsx)
+
+wb <- createWorkbook()
+header <- createStyle(textDecoration = "bold")
+
+addWorksheet(wb, "PH test death")
+writeData(wb, "PH test death", ph_DDS_all, headerStyle = header)
+
+addWorksheet(wb, "PH test recurrence")
+writeData(wb, "PH test recurrence", ph_RFS_all, headerStyle = header)
+
+saveWorkbook(wb, "Supplementary_Data_2_PH_xCell.xlsx", overwrite = TRUE)
+```
